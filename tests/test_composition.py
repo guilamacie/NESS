@@ -44,12 +44,14 @@ class TestParse:
 
 
 class TestCompile:
+    @needs_jax  # compile instantiates jax-backed plugins (upper/cap); pure-numpy compile checks stay below
     def test_T36_accidental_cycle_rejected(self, registry, scenario):
         upper = copy.deepcopy(UPPER)
         upper["inputs"]["main"]["sources"].append("module://cap/correction")  # cap reads upper, upper reads cap
         with pytest.raises(CompositionError, match="cycle"):
             _compile(registry, scenario, [BASE, upper, cap({"neural": 16}, {"neural": "module://upper/hidden"})])
 
+    @needs_jax  # compile instantiates jax-backed plugins (upper/cap); pure-numpy compile checks stay below
     def test_T36_cycle_accepted_only_inside_declared_workspace(self, registry, scenario):
         upper = copy.deepcopy(UPPER)
         upper["inputs"]["main"]["sources"].append("module://cap/correction")
@@ -62,6 +64,7 @@ class TestCompile:
             return
         assert compiled.spec.recurrent_regions
 
+    @needs_jax  # compile instantiates jax-backed plugins (upper/cap); pure-numpy compile checks stay below
     def test_unknown_port_and_node_and_scheme(self, registry, scenario):
         with pytest.raises(CompositionError, match="no output port"):
             _compile(registry, scenario, [BASE, cap({"neural": 16}, {"neural": "substrate://base_ts/state/middle"})])
@@ -70,6 +73,7 @@ class TestCompile:
         with pytest.raises(CompositionError, match="scheme"):
             _compile(registry, scenario, [BASE, cap({"neural": 16}, {"neural": "module://base_ts/state/final"})])  # substrate addressed as module
 
+    @needs_jax  # compile instantiates jax-backed plugins (upper/cap); pure-numpy compile checks stay below
     def test_T44_T21_outcome_field_cannot_be_wired(self, registry, scenario):
         sem = copy.deepcopy(SEMANTIC)
         sem["inputs"] = {"raw": "observation://target_future"}
@@ -80,6 +84,7 @@ class TestCompile:
         with pytest.raises(AccessPolicyViolation):
             _compile(registry, scenario, [BASE, sem, cap({"semantic": 4}, {"semantic": "semantic://semantic/features"})])
 
+    @needs_jax  # compile instantiates jax-backed plugins (upper/cap); pure-numpy compile checks stay below
     def test_learned_transform_into_host_runtime_rejected(self, registry, scenario):
         sem = copy.deepcopy(SEMANTIC)
         sem["config"]["use_neural"] = False
@@ -87,12 +92,14 @@ class TestCompile:
         with pytest.raises(CompositionError, match="learned boundary transform"):
             _compile(registry, scenario, [BASE, sem, cap({"semantic": 4}, {"semantic": "semantic://semantic/features"})])
 
+    @needs_jax  # compile instantiates jax-backed plugins (upper/cap); pure-numpy compile checks stay below
     def test_T35_add_with_incompatible_shapes_fails_before_execution(self, registry, scenario):
         upper = copy.deepcopy(UPPER)
         upper["inputs"]["main"] = {"merge": "add", "sources": ["substrate://base_ts/state/final", "observation://target_history"]}
         with pytest.raises(CompositionError, match="identical shapes"):
             _compile(registry, scenario, [BASE, upper, cap({"neural": 16}, {"neural": "module://upper/hidden"})])
 
+    @needs_jax  # compile instantiates jax-backed plugins (upper/cap); pure-numpy compile checks stay below
     def test_T35_add_across_incompatible_coordinates_needs_projection(self, registry, scenario):
         base2 = copy.deepcopy(BASE)
         base2["id"], base2["plugin"] = "base_conv", "toy_frozen_conv"
@@ -104,6 +111,7 @@ class TestCompile:
         upper["inputs"]["main"]["sources"][1] = {"from": "substrate://base_conv/state/final", "boundary": [{"kind": "linear", "out_dim": 16}]}
         _compile(registry, scenario, [BASE, base2, upper, cap({"neural": 16}, {"neural": "module://upper/hidden"})])
 
+    @needs_jax  # compile instantiates jax-backed plugins (upper/cap); pure-numpy compile checks stay below
     def test_required_port_unwired_and_disabled_node_reference(self, registry, scenario):
         base = copy.deepcopy(BASE)
         base.pop("inputs")
