@@ -1,0 +1,356 @@
+# NESS toy vertical slice - interpretable regime problem, arms A0-A5, substitution proofs.
+# Engineering validation of interfaces and controls; NOT evidence of predictive superiority.
+schema_version: ness.experiment/3
+protocol_id: toy_vertical_slice_v2
+
+runtime: {backend: auto, platform: cpu, x64: true, profile: development}
+
+scenario:
+  plugin: toy_regime_dataset
+  config:
+    n_steps: 720
+    context: 32
+    horizon: 4
+    seed: 2026
+    event_period: 25
+    event_length: 3
+    segment_length: 90
+    a: 0.6
+    phi_x: 0.8
+    sigma_x: 0.3
+    b_normal: 0.4
+    b_shift: -0.4
+    lag_normal: 1
+    lag_shift: 2
+    c_normal: 0.5
+    c_shift: 1.5
+    sigma_normal: 0.10
+    sigma_shift: 0.20
+    split_fractions: [0.6, 0.15, 0.25]
+
+tasks:
+  - id: future_y
+    plugin: point_forecast_task
+    config: {horizons: 4, channels: [y], functional: mean, loss: mse}
+
+protocol:
+  train_split: train
+  test_split: test
+  batch_size: 8
+  updates: 24
+  seeds: [0, 1, 2]           # model-initialisation seeds; the dataset seed is locked above
+  restore_check_requests: 16 # test requests re-predicted after checkpoint restore
+  causal_check: true
+
+# ------------------------------------------------------------------------------ fragments
+x-base: &base
+  id: base_ts
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y, x], forecast_channels: [y], horizons: 4, seed: 7, pretrain_steps: 400}
+  inputs: {history: observation://series_history}
+
+x-base-conv: &base_conv
+  id: base_ts
+  plugin: toy_frozen_conv
+  config: {width: 16, kernel: 3, layers: 2, channels: [y, x], forecast_channels: [y], horizons: 4, seed: 11, pretrain_steps: 400}
+  inputs: {history: observation://series_history}
+
+x-upper: &upper
+  id: upper
+  plugin: tiny_upper_transformer
+  config: {in_dim: 16, model_dim: 16, heads: 2}
+  inputs:
+    main:
+      merge: gated_add
+      sources:
+        - substrate://base_ts/state/final
+        - {from: substrate://base_ts/state/early, boundary: [{kind: linear, out_dim: 16}]}
+      post: [{kind: layer_norm}]
+
+x-upper-no-residual: &upper_no_residual
+  id: upper
+  plugin: tiny_upper_transformer
+  config: {in_dim: 16, model_dim: 16, heads: 2}
+  inputs: {main: substrate://base_ts/state/final}
+
+x-upper-mlp: &upper_mlp
+  id: upper
+  plugin: tiny_upper_mlp
+  config: {in_dim: 16, model_dim: 16, hidden_dim: 32}
+  inputs: {main: substrate://base_ts/state/final}
+
+# semantic adapter: raw series + upper hidden state + known-future events -> 8 typed features
+x-semantic-a3: &semantic
+  id: semantic
+  plugin: simple_temporal_semantics
+  config: {window: 8, channels: 2, cross_lag_corr: [1, 2], use_neural: true, use_events: true}
+  inputs:
+    raw: observation://series_history
+    neural: module://upper/hidden
+    events: observation://event_future
+
+x-program-slope: &program_slope
+  id: slope_program
+  plugin: typed_program
+  config:
+    output_dim: 2
+    port_bindings: {series: {port: series, dim: 2}}
+    constants: {window: 8}
+    program:
+      schema_version: ness.program/1
+      name: window_slope_8
+      semantics: typed_numeric_v1
+      example_status: illustrative_proposed
+      inputs: {series: numeric_series, window: int}
+      output: numeric_vector
+      body: {op: call, primitive: window_slope, args: {series: {op: input, name: series}, window: {op: input, name: window}}}
+  inputs: {series: observation://series_history}
+
+x-program-event: &program_event
+  id: event_program
+  plugin: typed_program
+  config:
+    output_dim: 1
+    port_bindings: {events: {port: events, shape: [4, 1], semantic_type: event_indicator, accepts: [event_indicator]}}
+    constants: {horizon: 4}
+    program:
+      schema_version: ness.program/1
+      name: event_active_at_origin_h4
+      semantics: typed_numeric_v1
+      example_status: illustrative_proposed
+      inputs: {events: numeric_series, horizon: int}
+      output: numeric_vector
+      body: {op: call, primitive: event_active_at_origin, args: {events: {op: input, name: events}, horizon: {op: input, name: horizon}}}
+  inputs: {events: observation://event_future}
+
+# exact two-state reasoner over the 8 semantic features; emissions fitted on the TRAIN split
+# by examples/vertical_slice_timeseries/fit_regime_emissions.py (see report §8)
+x-regime: &regime
+  id: regime
+  plugin: exact_finite_regime_reasoner
+  config:
+    feature_ports: {semantic: 8}
+    model:
+      latent_name: regime
+      states: [NORMAL, SHIFT]
+      prior: [0.5, 0.5]
+      emission:
+        family: gaussian_diag
+        means: [[-0.0089, -0.0077, 0.3121, 0.3203, 0.5211, 0.5122, 0.0, 0.1039], [0.0106, 0.009, 0.4886, 0.3292, 0.0186, -0.0181, 0.0, 0.1333]]   # fitted on the train split (fit_regime_emissions.py); neural_cue uninformative
+        scales: [[0.1201, 0.1156, 0.1094, 0.0444, 0.4414, 0.4535, 10.0, 0.2232], [0.2182, 0.1083, 0.0987, 0.0422, 0.371, 0.3343, 10.0, 0.2449]]
+  inputs: {semantic: semantic://semantic/features}
+
+x-regime-trivial: &regime_trivial      # deterministic reasoner from the external example plugin
+  id: regime
+  plugin: deterministic_threshold_reasoner
+  config: {states: [SHIFT, NORMAL], feature_ports: {features: 8}, feature_index: 4, threshold: 0.27}   # xcorr_lag1 > 0.27 -> NORMAL
+  inputs: {features: semantic://semantic/features}
+
+x-memory-query: &memory_query
+  id: analogues
+  plugin: analogue_memory_query
+  config: {store: episodes, namespace: episodes, k: 3, horizon: 4, channels: 1, query_channels: 2}
+  inputs: {query: observation://series_history}
+
+x-memory: &memory
+  name: episodes
+  store: {plugin: in_memory_snapshot_store}
+  namespace: episodes
+  seed_from_scenario: true
+  learner_appends: true
+  episode_window_field: series_history
+
+x-learning: &learning
+  rule: bp_direct
+  optimizer: {kind: adam, lr: 0.003, clip_norm: 5.0}
+
+x-cap-a1: &cap_a1
+  id: cap
+  plugin: residual_point_cap
+  config: {channels: [y], horizons: 4, features: {neural: 16}}
+  inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden}
+
+x-cap-a2: &cap_a2
+  id: cap
+  plugin: residual_point_cap
+  config: {channels: [y], horizons: 4, features: {neural: 16, semantic: 8, slope: 2, event: 1}}
+  inputs:
+    baseline: substrate://base_ts/forecast/point
+    neural: module://upper/hidden
+    semantic: semantic://semantic/features
+    slope: program://slope_program/value
+    event: program://event_program/value
+
+x-cap-a3: &cap_a3
+  id: cap
+  plugin: residual_point_cap
+  config: {channels: [y], horizons: 4, features: {neural: 16, semantic: 8, slope: 2, event: 1, posterior: 2}}
+  inputs:
+    baseline: substrate://base_ts/forecast/point
+    neural: module://upper/hidden
+    semantic: semantic://semantic/features
+    slope: program://slope_program/value
+    event: program://event_program/value
+    posterior: reasoner://regime/posterior
+
+x-cap-a4: &cap_a4
+  id: cap
+  plugin: residual_point_cap
+  config: {channels: [y], horizons: 4, features: {neural: 16, semantic: 8, slope: 2, event: 1, posterior: 2, memory: 4}}
+  inputs:
+    baseline: substrate://base_ts/forecast/point
+    neural: module://upper/hidden
+    semantic: semantic://semantic/features
+    slope: program://slope_program/value
+    event: program://event_program/value
+    posterior: reasoner://regime/posterior
+    memory: memory://analogues/evidence
+
+# A5 same-fact neural control: the same permitted raw facts the symbolic path reads (the 32x2
+# window, the known-future events) enter the cap directly as dense features; no programs, no
+# semantic adapter, no reasoner.
+x-cap-a5: &cap_a5
+  id: cap
+  plugin: residual_point_cap
+  config: {channels: [y], horizons: 4, features: {neural: 16, raw_window: 64, events: 4}}
+  inputs:
+    baseline: substrate://base_ts/forecast/point
+    neural: module://upper/hidden
+    raw_window: {from: observation://series_history, boundary: [flatten]}
+    events: {from: observation://event_future, boundary: [flatten]}
+
+arms:
+  A0_frozen_baseline:
+    description: frozen lower transformer's native point forecast; no learned cap
+    seed: 0
+    composition: {nodes: [*base], output: {task: future_y, from: substrate://base_ts/forecast/point}}
+  A1_neural_cap:
+    description: frozen base + trainable upper transformer (final + projected early residual) + residual point cap
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base, *upper, *cap_a1], output: {task: future_y, from: module://cap/forecast}}
+  A2_neural_symbolic:
+    description: A1 + semantic adapter (raw + upper state + events) + typed slope and event programs
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base, *upper, *semantic, *program_slope, *program_event, *cap_a2], output: {task: future_y, from: module://cap/forecast}}
+  A3_neural_symbolic_probabilistic:
+    description: A2 + exact two-state regime reasoner (posterior HypothesisEvidence)
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base, *upper, *semantic, *program_slope, *program_event, *regime, *cap_a3], output: {task: future_y, from: module://cap/forecast}}
+  A4_full_with_memory:
+    description: A3 + pinned analogue memory (matured episodes only; learner appends between updates)
+    seed: 0
+    learning: *learning
+    memory: *memory
+    composition: {nodes: [*base, *upper, *semantic, *program_slope, *program_event, *regime, *memory_query, *cap_a4], output: {task: future_y, from: module://cap/forecast}}
+  A5_same_fact_neural:
+    description: same permitted raw facts as A2/A3 (window, known-future events) fed directly to the cap; no symbolic composition
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base, *upper, *cap_a5], output: {task: future_y, from: module://cap/forecast}}
+
+# ------------------------------------------------------------------------------ substitution proofs
+# Each entry is a complete arm built from the fragments above by configuration only.
+substitutions:
+  - id: S01_lower_provider_conv
+    description: lower provider A (transformer) -> provider B (causal conv)
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base_conv, *upper_no_residual, *cap_a1], output: {task: future_y, from: module://cap/forecast}}
+  - id: S02_upper_mlp
+    description: upper transformer -> MLP upper module
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base, *upper_mlp, *cap_a1], output: {task: future_y, from: module://cap/forecast}}
+  - id: S03a_semantic_raw_only
+    description: semantic adapter reads raw input only
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base
+        - *upper
+        - {id: semantic, plugin: simple_temporal_semantics, config: {window: 8, channels: 2, cross_lag_corr: [1, 2], use_neural: false, use_events: false}, inputs: {raw: observation://series_history}}
+        - {id: cap, plugin: residual_point_cap, config: {channels: [y], horizons: 4, features: {neural: 16, semantic: 6}}, inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden, semantic: semantic://semantic/features}}
+      output: {task: future_y, from: module://cap/forecast}
+  - id: S03b_semantic_base_final_only
+    description: semantic adapter reads raw (required) + base final state instead of the upper state
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base
+        - *upper
+        - {id: semantic, plugin: simple_temporal_semantics, config: {window: 8, channels: 2, cross_lag_corr: [1, 2], use_neural: true, use_events: false}, inputs: {raw: observation://series_history, neural: substrate://base_ts/state/final}}
+        - {id: cap, plugin: residual_point_cap, config: {channels: [y], horizons: 4, features: {neural: 16, semantic: 7}}, inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden, semantic: semantic://semantic/features}}
+      output: {task: future_y, from: module://cap/forecast}
+  - id: S03c_semantic_raw_plus_final
+    description: semantic adapter reads raw + base final
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base
+        - *upper
+        - {id: semantic, plugin: simple_temporal_semantics, config: {window: 8, channels: 2, cross_lag_corr: [1, 2], use_neural: true, use_events: false}, inputs: {raw: observation://series_history, neural: substrate://base_ts/state/final}}
+        - {id: cap, plugin: residual_point_cap, config: {channels: [y], horizons: 4, features: {neural: 16, semantic: 7}}, inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden, semantic: semantic://semantic/features}}
+      output: {task: future_y, from: module://cap/forecast}
+  - id: S03d_semantic_raw_early_final
+    description: semantic adapter reads raw + early (neural port) + final (base_context port)
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base
+        - *upper
+        - {id: semantic, plugin: simple_temporal_semantics, config: {window: 8, channels: 2, cross_lag_corr: [1, 2], use_neural: true, use_base_context: true, use_events: false}, inputs: {raw: observation://series_history, neural: substrate://base_ts/state/early, base_context: substrate://base_ts/state/final}}
+        - {id: cap, plugin: residual_point_cap, config: {channels: [y], horizons: 4, features: {neural: 16, semantic: 8}}, inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden, semantic: semantic://semantic/features}}
+      output: {task: future_y, from: module://cap/forecast}
+  - id: S04_residual_off
+    description: early-state residual into the upper module disabled
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base, *upper_no_residual, *cap_a1], output: {task: future_y, from: module://cap/forecast}}
+  - id: S05_rms_norm
+    description: boundary normalisation layer_norm -> rms_norm
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base
+        - {id: upper, plugin: tiny_upper_transformer, config: {in_dim: 16, model_dim: 16, heads: 2}, inputs: {main: {merge: gated_add, sources: [substrate://base_ts/state/final, {from: substrate://base_ts/state/early, boundary: [{kind: linear, out_dim: 16}]}], post: [{kind: rms_norm}]}}}
+        - *cap_a1
+      output: {task: future_y, from: module://cap/forecast}
+  - id: S06_programs_disabled
+    description: symbolic programs removed (semantic adapter kept)
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base
+        - *upper
+        - *semantic
+        - {id: cap, plugin: residual_point_cap, config: {channels: [y], horizons: 4, features: {neural: 16, semantic: 8}}, inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden, semantic: semantic://semantic/features}}
+      output: {task: future_y, from: module://cap/forecast}
+  - id: S07_trivial_reasoner
+    description: exact reasoner -> deterministic threshold reasoner (external plugin)
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base, *upper, *semantic, *program_slope, *program_event, *regime_trivial, *cap_a3], output: {task: future_y, from: module://cap/forecast}}
+  - id: S08_memory_disabled
+    description: memory removed from the full cap
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base, *upper, *semantic, *program_slope, *program_event, *regime, *cap_a3], output: {task: future_y, from: module://cap/forecast}}
+  - id: S09_writer_consumer_changed
+    description: bounded writer (external plugin) + MLP consumer
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base
+        - *upper
+        - {id: cap, plugin: residual_point_cap, config: {channels: [y], horizons: 4, features: {neural: 16}, writer: {plugin: bounded_point_writer, config: {bound: 0.5}}, consumer: {plugin: concat_linear_consumer, config: {hidden: 8}}}, inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden}}
+      output: {task: future_y, from: module://cap/forecast}

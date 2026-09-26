@@ -1,0 +1,66 @@
+{
+  "schema": "ness.compat.fabricpc/1",
+  "policy": {
+    "supported_families": {"0.6": {"adapter": "ness.backends.fabricpc.compat.v0_6", "tested_versions": ["0.6.0"]}},
+    "declared_range": "fabricpc>=0.6.0,<0.7",
+    "jax_range": "jax>=0.7.0,<0.11",
+    "status_vocabulary": ["verified", "qualified", "experimental", "unsupported"],
+    "rule": "A capability is verified only when its contract test passed through the NESS public runtime path on the listed environment. A new FabricPC release is never blessed by import success; follow docs/FABRICPC_UPGRADE.md."
+  },
+  "entries": [
+    {
+      "id": "2026-09-26-cpu-linux-x86_64",
+      "ness_version": "0.1.0 (2026-09-26 working tree, FabricPC integration iteration)",
+      "fabricpc_version": "0.6.0",
+      "fabricpc_artifact": "sha256:50766c7cda6dbe1325eb7e673410a88ad0bb0cd0e5020ab76f303575c006b46f (fabricpc-0.6.0-py3-none-any.whl, PyPI)",
+      "fabricpc_upstream_revision": "8406e6a838442391fd3089958e1a2c1b44c57eda (tag v0.6.0, trueagi-io/FabricPC)",
+      "fabricpc_adapter_version": "0.6-adapter/1.0.0",
+      "python": "3.11.10",
+      "jax": "0.10.2",
+      "jaxlib": "0.10.2",
+      "optax": "0.2.8",
+      "platform": "Linux-5.15.0-191-generic-x86_64-with-glibc2.35",
+      "accelerator_runtime": "XLA CPU (JAX_PLATFORMS=cpu); 2 host devices forced with XLA_FLAGS=--xla_force_host_platform_device_count=2 for the multi-device leg",
+      "accelerator_model": "host CPU",
+      "device_count_tested": [1, 2],
+      "data_parallel": "verified (tests/fabricpc_backend/test_fabricpc_multidevice.py::test_data_parallel_matches_single_device_on_two_forced_cpu_devices: grads/loss/predictions identical to <1e-9, odd batch refused)",
+      "model_parallel": "unsupported (FabricPC 0.6 ships no parameter sharding; NESS claims none)",
+      "multi_host": "unsupported (single process; not exercised)",
+      "pc_algorithms_verified": ["fabricpc_pc_local with fabricpc_spc (InferenceSGD)", "fabricpc_pc_local with fabricpc_epc (EPCInference)"],
+      "pc_algorithms_experimental": ["fabricpc_spc_recurrent (cyclic graph, unroll=U) with fabricpc_pc_local"],
+      "bp_algorithms_verified": ["fabricpc_bp_through_inference with fabricpc_feedforward (== PDF ff_bp; gradient parity with the NESS jax backend to 1e-8)", "fabricpc_bp_through_inference with fabricpc_spc (PDF workspace_bp_unroll)"],
+      "checkpoint_compatibility": "state schema ness.cap.fabricpc_residual/1; restricted .npy arrays keyed <node>|weights|<edge>; round trip bitwise (tests/fabricpc_backend/test_fabricpc_checkpoint.py)",
+      "test_artifact": "pytest tests/fabricpc_backend tests/test_bootstrap_import_order.py tests/test_jax_backend_sharded.py: 36 passed, 1 skipped (2-GPU leg) on 2026-09-26",
+      "known_issues": [
+        "Target-free sPC/ePC settling on an acyclic workspace with FeedforwardStateInit is the feedforward prediction (equilibrium at init); use state_init: global_normal or the recurrent profile for settling to change the deployed prediction.",
+        "fabricpc_pc_local requires all-true outcome masks (FabricPC energies are per sample).",
+        "InferenceSchedule (composed ePC->sPC) is not exposed by NESS plugins yet (experimental)."
+      ]
+    },
+    {
+      "id": "2026-09-26-gpu-cuda12-2xrtx3090",
+      "ness_version": "0.1.0 (2026-09-26 working tree, FabricPC integration iteration)",
+      "fabricpc_version": "0.6.0",
+      "fabricpc_artifact": "sha256:50766c7cda6dbe1325eb7e673410a88ad0bb0cd0e5020ab76f303575c006b46f",
+      "fabricpc_upstream_revision": "8406e6a838442391fd3089958e1a2c1b44c57eda",
+      "fabricpc_adapter_version": "0.6-adapter/1.0.0",
+      "python": "3.11.10",
+      "jax": "0.10.2",
+      "jaxlib": "0.10.2",
+      "optax": "0.2.8",
+      "platform": "Linux-5.15.0-191-generic-x86_64-with-glibc2.35",
+      "accelerator_runtime": "CUDA 12 via jax-cuda12-plugin 0.10.2 / jax-cuda12-pjrt 0.10.2, nvidia-cublas-cu12 12.9.2.10; NVIDIA driver 595.84; installed with: pip install -U 'ness[fabricpc]' 'fabricpc[cuda12]'",
+      "accelerator_model": "NVIDIA GeForce RTX 3090 (24 GB) x 2",
+      "device_count_tested": [1, 2],
+      "data_parallel": "verified (ness doctor probe: 2 x gpu sharded vs single-device gradients max diff 5.6e-17; tests/fabricpc_backend/test_fabricpc_multidevice.py 2-GPU leg)",
+      "model_parallel": "unsupported",
+      "multi_host": "unsupported",
+      "pc_algorithms_verified": ["fabricpc_pc_local with fabricpc_spc", "fabricpc_pc_local with fabricpc_epc"],
+      "pc_algorithms_experimental": ["fabricpc_spc_recurrent"],
+      "bp_algorithms_verified": ["fabricpc_bp_through_inference (feedforward and settled)"],
+      "checkpoint_compatibility": "ness.cap.fabricpc_residual/1 (same as CPU entry)",
+      "test_artifact": "ness doctor --backend fabricpc --platform gpu (setup_before_backend_init=True; single_gpu verified; data_parallelism verified) and pytest tests/fabricpc_backend tests/test_bootstrap_import_order.py tests/test_jax_backend_sharded.py in .venv-gpu on 2026-09-26",
+      "known_issues": ["same as CPU entry", "GPU numerical parity with CPU is tolerance-level, not bitwise (deterministic_replay is per device)"]
+    }
+  ]
+}

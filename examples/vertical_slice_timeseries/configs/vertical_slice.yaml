@@ -1,0 +1,221 @@
+# NESS vertical slice: synthetic time series. Six arms exercising every public macro-layer
+# interface. Engineering demonstration, not a research claim.
+schema_version: ness.experiment/3
+protocol_id: vertical_slice_ts_v1
+
+scenario:
+  plugin: toy_temporal_dataset
+  config: {n_steps: 600, context: 32, horizon: 4, seed: 1234, train_fraction: 0.7}
+
+tasks:
+  - id: future_value
+    plugin: point_forecast_task
+    config: {horizons: 4, channels: [y0, y1], functional: mean, loss: mse}
+
+protocol:
+  train_split: train
+  test_split: test
+  batch_size: 8
+  updates: 16
+  max_test_requests: 96
+
+# ---- reusable fragments -------------------------------------------------------------
+x-base-substrate: &base_substrate
+  id: base_ts
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7}
+  inputs:
+    history: observation://target_history
+
+x-upper: &upper
+  id: upper
+  plugin: tiny_upper_transformer
+  config: {in_dim: 16, model_dim: 16, heads: 2}
+  inputs:
+    main:
+      merge: gated_add
+      sources:
+        - substrate://base_ts/state/final
+        - {from: substrate://base_ts/state/early, boundary: [{kind: linear, out_dim: 16}]}
+      post: [{kind: layer_norm}]
+
+x-semantic: &semantic
+  id: semantic
+  plugin: simple_temporal_semantics
+  config: {window: 8, channels: 2, use_neural: true}
+  inputs:
+    raw: observation://target_history
+    neural: module://upper/hidden
+
+x-program: &program
+  id: slope_program
+  plugin: typed_program
+  config:
+    output_dim: 2
+    port_bindings: {series: {port: series, dim: 2}}
+    constants: {window: 8}
+    program:
+      schema_version: ness.program/1
+      name: window_slope_8
+      semantics: typed_numeric_v1
+      example_status: illustrative_proposed
+      inputs: {series: numeric_series, window: int}
+      output: numeric_vector
+      body: {op: call, primitive: window_slope, args: {series: {op: input, name: series}, window: {op: input, name: window}}}
+  inputs:
+    series: observation://target_history
+
+x-regime: &regime
+  id: regime
+  plugin: exact_finite_regime_reasoner
+  config:
+    feature_ports: {semantic: 5, program: 2}
+    model:
+      latent_name: regime
+      states: [calm, volatile]
+      prior: [0.5, 0.5]
+      emission:
+        family: gaussian_diag
+        means:  [[0.0, 0.0, 0.15, 0.10, 0.0, 0.0, 0.0], [0.0, 0.0, 0.45, 0.25, 0.0, 0.0, 0.0]]
+        scales: [[0.3, 0.3, 0.10, 0.08, 1.0, 0.3, 0.3], [0.3, 0.3, 0.20, 0.15, 1.0, 0.3, 0.3]]
+  inputs:
+    semantic: semantic://semantic/features
+    program: program://slope_program/value
+
+x-memory: &memory_query
+  id: analogues
+  plugin: analogue_memory_query
+  config: {store: episodes, namespace: episodes, k: 3, horizon: 4, channels: 2}
+  inputs:
+    query: observation://target_history
+
+x-learning: &learning
+  rule: bp_direct
+  optimizer: {kind: adam, lr: 0.003, clip_norm: 5.0}
+
+arms:
+  native_baseline:
+    description: frozen provider's own point forecast; no trainable parameters
+    seed: 0
+    composition:
+      nodes: [*base_substrate]
+      output: {task: future_value, from: substrate://base_ts/forecast/point}
+
+  neural_only_cap:
+    description: upper transformer (final + projected early residual) -> residual point cap
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base_substrate
+        - *upper
+        - id: cap
+          plugin: residual_point_cap
+          config: {channels: [y0, y1], horizons: 4, features: {neural: 16}}
+          inputs:
+            baseline: substrate://base_ts/forecast/point
+            neural: module://upper/hidden
+      output: {task: future_value, from: module://cap/forecast}
+
+  neuro_symbolic_cap:
+    description: adds semantic adapter (raw + upper state) and a typed temporal program
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base_substrate
+        - *upper
+        - *semantic
+        - *program
+        - id: cap
+          plugin: residual_point_cap
+          config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 5, program: 2}}
+          inputs:
+            baseline: substrate://base_ts/forecast/point
+            neural: module://upper/hidden
+            semantic: semantic://semantic/features
+            program: program://slope_program/value
+      output: {task: future_value, from: module://cap/forecast}
+
+  neuro_symbolic_probabilistic_cap:
+    description: adds the exact finite regime reasoner (posterior HypothesisEvidence)
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base_substrate
+        - *upper
+        - *semantic
+        - *program
+        - *regime
+        - id: cap
+          plugin: residual_point_cap
+          config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 5, program: 2, posterior: 2}}
+          inputs:
+            baseline: substrate://base_ts/forecast/point
+            neural: module://upper/hidden
+            semantic: semantic://semantic/features
+            program: program://slope_program/value
+            posterior: reasoner://regime/posterior
+      output: {task: future_value, from: module://cap/forecast}
+
+  with_memory:
+    description: same cap plus a pinned analogue memory query
+    seed: 0
+    learning: *learning
+    memory:
+      name: episodes
+      store: {plugin: in_memory_snapshot_store}
+      namespace: episodes
+      seed_from_scenario: true
+      learner_appends: true
+      episode_window_field: target_history
+    composition:
+      nodes:
+        - *base_substrate
+        - *upper
+        - *semantic
+        - *program
+        - *regime
+        - *memory_query
+        - id: cap
+          plugin: residual_point_cap
+          config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 5, program: 2, posterior: 2, memory: 8}}
+          inputs:
+            baseline: substrate://base_ts/forecast/point
+            neural: module://upper/hidden
+            semantic: semantic://semantic/features
+            program: program://slope_program/value
+            posterior: reasoner://regime/posterior
+            memory: memory://analogues/evidence
+      output: {task: future_value, from: module://cap/forecast}
+
+  provider_substitution:
+    description: lower substrate swapped to a conv provider; upper swapped to an MLP; nothing else changes
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - id: base_ts
+          plugin: toy_frozen_conv
+          config: {width: 16, kernel: 3, layers: 2, channels: [y0, y1], horizons: 4, seed: 11}
+          inputs:
+            history: observation://target_history
+        - id: upper
+          plugin: tiny_upper_mlp
+          config: {in_dim: 16, model_dim: 16, hidden_dim: 32}
+          inputs:
+            main: substrate://base_ts/state/final
+        - *semantic
+        - *program
+        - *regime
+        - id: cap
+          plugin: residual_point_cap
+          config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 5, program: 2, posterior: 2}}
+          inputs:
+            baseline: substrate://base_ts/forecast/point
+            neural: module://upper/hidden
+            semantic: semantic://semantic/features
+            program: program://slope_program/value
+            posterior: reasoner://regime/posterior
+      output: {task: future_value, from: module://cap/forecast}

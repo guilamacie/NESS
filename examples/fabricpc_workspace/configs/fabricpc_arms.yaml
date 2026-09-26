@@ -1,0 +1,117 @@
+# FabricPC-backed workspace arms on the same synthetic scenario as the vertical slice.
+# Every arm below is target-free at prediction; learning rules are separate declarations.
+schema_version: ness.experiment/3
+protocol_id: fabricpc_workspace_v1
+
+runtime:
+  backend: auto          # derived from the arms (fabricpc here); may be forced to numpy|jax|fabricpc
+  platform: auto         # cpu | gpu | auto ; a gpu request fails closed unless devices.fallback: cpu
+  devices: {platform: any, selection: all}
+  x64: true
+  profile: development   # scientific => unverified FabricPC versions / late setup_jax fail closed
+
+scenario:
+  plugin: toy_temporal_dataset
+  config: {n_steps: 600, context: 32, horizon: 4, seed: 1234, train_fraction: 0.7}
+
+tasks:
+  - id: future_value
+    plugin: point_forecast_task
+    config: {horizons: 4, channels: [y0, y1]}
+
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 12, max_test_requests: 64}
+
+x-base: &base
+  id: base_ts
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7}
+  inputs: {history: observation://target_history}
+
+x-semantic: &semantic
+  id: semantic
+  plugin: simple_temporal_semantics
+  config: {window: 8, channels: 2, use_neural: false}
+  inputs: {raw: observation://target_history}
+
+# Packed evidence for the workspace: the final substrate state pooled over time (a declared,
+# non-learned boundary reduction) plus the semantic features. No learned transform may feed
+# a FabricPC node: gradients do not cross runtimes.
+x-cap-inputs: &cap_inputs
+  baseline: substrate://base_ts/forecast/point
+  neural: {from: substrate://base_ts/state/final, boundary: [mean_pool]}
+  semantic: semantic://semantic/features
+
+arms:
+  native_baseline:
+    seed: 0
+    composition: {nodes: [*base], output: {task: future_value, from: substrate://base_ts/forecast/point}}
+
+  jax_dense_bp:                       # same dense computation on the NESS JAX backend (parity twin)
+    seed: 0
+    learning: {rule: bp_direct, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - *base
+        - *semantic
+        - {id: cap, plugin: jax_dense_workspace_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 4}, hidden: [16]}, inputs: *cap_inputs}
+      output: {task: future_value, from: module://cap/forecast}
+
+  fabricpc_feedforward_bp:            # FabricPC graph, no settling, BP of the task loss (PDF ff_bp)
+    seed: 0
+    inference: {profile: fabricpc_feedforward}
+    learning: {rule: fabricpc_bp_through_inference, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - *base
+        - *semantic
+        - {id: cap, plugin: fabricpc_residual_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 4}, hidden: [16], inference: {profile: fabricpc_feedforward}}, inputs: *cap_inputs}
+      output: {task: future_value, from: module://cap/forecast}
+
+  fabricpc_spc_pc_local:              # sPC free inference at prediction; clamped local PC rule for learning (PDF workspace_pc_local)
+    seed: 0
+    inference: {profile: fabricpc_spc}
+    learning: {rule: workspace_pc_local, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - *base
+        - *semantic
+        - {id: cap, plugin: fabricpc_residual_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 4}, hidden: [16], inference: {profile: fabricpc_spc, eta_infer: 0.05, infer_steps: 20}}, inputs: *cap_inputs}
+      output: {task: future_value, from: module://cap/forecast}
+
+  fabricpc_spc_bp_unroll:             # same deployed inference; BP through the finite settle (PDF workspace_bp_unroll)
+    seed: 0
+    inference: {profile: fabricpc_spc}
+    learning: {rule: workspace_bp_unroll, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - *base
+        - *semantic
+        - {id: cap, plugin: fabricpc_residual_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 4}, hidden: [16], inference: {profile: fabricpc_spc, eta_infer: 0.05, infer_steps: 20}}, inputs: *cap_inputs}
+      output: {task: future_value, from: module://cap/forecast}
+
+  fabricpc_epc_pc_local:              # ePC free inference; local rule after ePC settle (PDF workspace_epc_local)
+    seed: 0
+    inference: {profile: fabricpc_epc}
+    learning: {rule: workspace_epc_local, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - *base
+        - *semantic
+        - {id: cap, plugin: fabricpc_residual_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 4}, hidden: [16, 16], inference: {profile: fabricpc_epc, eta_infer: 0.05, infer_steps: 5}}, inputs: *cap_inputs}
+      output: {task: future_value, from: module://cap/forecast}
+
+  hybrid_jax_upper_fabricpc_cap:      # jax upper module trained by BP; FabricPC cap by the local PC rule (PDF §11.6 hybrid credit)
+    seed: 0
+    inference: {profile: fabricpc_spc}
+    learning:
+      rule: bp_direct
+      optimizer: {kind: adam, lr: 0.003}
+      credit: {overrides: {"cap/workspace": fabricpc_pc_local}}
+    composition:
+      nodes:
+        - *base
+        - {id: upper, plugin: tiny_upper_mlp, config: {in_dim: 16, model_dim: 8}, inputs: {main: substrate://base_ts/state/final}}
+        - *semantic
+        - {id: cap, plugin: fabricpc_residual_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 8, semantic: 4}, hidden: [16], inference: {profile: fabricpc_spc, eta_infer: 0.05, infer_steps: 10}},
+           inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden, semantic: semantic://semantic/features}}
+      output: {task: future_value, from: module://cap/forecast}

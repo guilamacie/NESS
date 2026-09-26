@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"   # weekly compatibility canary (non-blocking job below)
+
+jobs:
+  core-no-jax:
+    # Level A: core must import, validate, inspect and pass core tests with neither JAX nor FabricPC.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: {python: ["3.11", "3.12", "3.13"]}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python }}"}
+      - run: python -m pip install -U pip build
+      - run: python -m build
+      - run: python -m venv /tmp/fresh && /tmp/fresh/bin/pip install dist/*.whl pytest pyyaml
+      - run: /tmp/fresh/bin/python -c "import sys, ness; assert 'jax' not in sys.modules and 'fabricpc' not in sys.modules"
+      - run: /tmp/fresh/bin/ness plugins && /tmp/fresh/bin/ness audit && /tmp/fresh/bin/ness doctor --backend numpy
+      - run: /tmp/fresh/bin/ness validate examples/vertical_slice_timeseries/configs/vertical_slice.yaml --schema-only
+      - run: /tmp/fresh/bin/pip install -e examples/external_plugin_example
+      # jax-requiring tests skip themselves; everything else must pass without jax
+      - run: /tmp/fresh/bin/python -m pytest -q tests/test_contracts.py tests/test_symbolic.py tests/test_memory.py tests/test_probabilistic.py tests/test_composition.py tests/test_tasks_scenario.py tests/test_checkpoint.py tests/test_devices.py tests/test_bootstrap_import_order.py tests/test_plugins_external.py -p no:cacheprovider
+
+  jax-cpu:
+    # Level B: the NESS JAX backend at the minimum and the primary tested JAX versions.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        jax: ["0.7.0", "0.10.2"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: python -m pip install -U pip && pip install -e ".[dev]" "jax==${{ matrix.jax }}" && pip install -e examples/external_plugin_example
+      - run: ness doctor --backend jax --platform cpu --json doctor.json
+      - run: python -m pytest -q -p no:cacheprovider --ignore=tests/fabricpc_backend
+      - uses: actions/upload-artifact@v4
+        with: {name: "doctor-jax-${{ matrix.jax }}", path: doctor.json}
+
+  fabricpc-cpu:
+    # Level C: minimum verified FabricPC, plus the newest release inside the declared range.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        fabricpc: ["0.6.0", "<0.7"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: python -m pip install -U pip && pip install -e ".[dev-fabricpc]" "fabricpc${{ matrix.fabricpc == '0.6.0' && '==0.6.0' || matrix.fabricpc }}" && pip install -e examples/external_plugin_example
+      - run: ness doctor --backend fabricpc --platform cpu --json doctor.json
+      - run: python -m pytest -q -p no:cacheprovider tests/fabricpc_backend tests/test_bootstrap_import_order.py
+      - run: XLA_FLAGS=--xla_force_host_platform_device_count=2 python -m pytest -q -p no:cacheprovider tests/fabricpc_backend/test_fabricpc_multidevice.py -m multidevice
+      - run: python -m pytest -q -p no:cacheprovider --ignore=tests/fabricpc_backend
+      - uses: actions/upload-artifact@v4
+        with: {name: "doctor-fabricpc-${{ strategy.job-index }}", path: doctor.json}
+
+  fabricpc-canary:
+    # Non-blocking: newest FabricPC release and upstream main. Failure = maintenance signal,
+    # never an automatic widening of the compatibility range.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        source: ["fabricpc", "git+https://github.com/trueagi-io/FabricPC.git@main"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: python -m pip install -U pip && pip install -e ".[dev]" "${{ matrix.source }}"
+      - run: NESS_FABRICPC_ALLOW_UNVERIFIED=1 ness doctor --backend fabricpc --platform cpu || true
+      - run: NESS_FABRICPC_ALLOW_UNVERIFIED=1 python -m pytest -q -p no:cacheprovider tests/fabricpc_backend || echo "::warning::FabricPC canary failed - open a maintenance issue; do NOT widen the compatibility range"
+
+  gpu:
+    # Dedicated runner with >= 2 NVIDIA GPUs (self-hosted label). Absence of the runner is not a
+    # test failure; the job simply does not run.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: [self-hosted, gpu, cuda12]
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m venv .venv-gpu && .venv-gpu/bin/pip install -U pip
+      - run: .venv-gpu/bin/pip install -U -e ".[fabricpc]" "fabricpc[cuda12]" pytest
+      - run: .venv-gpu/bin/ness doctor --backend fabricpc --platform gpu --json doctor-gpu.json
+      - run: .venv-gpu/bin/python -m pytest -q -p no:cacheprovider -m "gpu or multidevice" tests/fabricpc_backend
+      - run: .venv-gpu/bin/python -m pytest -q -p no:cacheprovider tests/fabricpc_backend tests/test_bootstrap_import_order.py tests/test_jax_backend_sharded.py
+      - uses: actions/upload-artifact@v4
+        with: {name: doctor-gpu, path: doctor-gpu.json}

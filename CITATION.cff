@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use NESS in your research, please cite it as below."
+title: "NESS: a composable research platform for neural-symbolic-probabilistic predictive systems"
+type: software
+version: 0.1.0
+date-released: 2026-09-26
+license: Apache-2.0
+repository-code: "https://github.com/guilamacie/NESS"
+url: "https://github.com/guilamacie/NESS"
+abstract: >-
+  NESS implements the Neural-Symbolic Sandwich architecture as a plugin platform: frozen
+  substrates, trainable upper modules, semantic adapters, typed symbolic programs, exact and
+  sampled probabilistic reasoners, pinned analogue memory and caps, composed by configuration
+  into a validated macro graph, learned through a NESS JAX backend or the FabricPC 0.6
+  predictive-coding backend, and checkpointed and restored as one system.
+authors:
+  - name: "NESS research programme"
+  - name: "guilamacie"
+keywords:
+  - neuro-symbolic
+  - predictive coding
+  - FabricPC
+  - JAX
+  - composable architecture

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ness-example-plugin"
+version = "0.1.0"
+description = "Example third-party NESS plugin package: a lower substrate, a reasoner, a writer and a heavy-dependency plugin, registered without touching ness core."
+requires-python = ">=3.11"
+dependencies = ["ness", "numpy>=1.26"]
+
+# Registration = one entry point per plugin, pointing at a lightweight descriptor object.
+[project.entry-points."ness.plugins"]
+toy_linear_ar_substrate = "ness_example_plugin.descriptors:TOY_LINEAR_AR_SUBSTRATE"
+deterministic_threshold_reasoner = "ness_example_plugin.descriptors:DETERMINISTIC_THRESHOLD_REASONER"
+bounded_point_writer = "ness_example_plugin.descriptors:BOUNDED_POINT_WRITER"
+heavy_dependency_substrate = "ness_example_plugin.descriptors:HEAVY_DEPENDENCY_SUBSTRATE"
+
+[tool.setuptools.packages.find]
+where = ["src"]

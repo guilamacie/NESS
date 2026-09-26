@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ness"
+version = "0.1.0"
+description = "NESS cross-domain research platform: typed evidence, macro composition graphs, pluggable substrates/upper modules/reasoners/memory, whole-system checkpoints."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "NESS research programme" }]
+maintainers = [{ name = "guilamacie" }]
+keywords = ["neuro-symbolic", "predictive-coding", "fabricpc", "jax", "time-series", "composable", "research-platform"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Level B: the NESS JAX backend (generic differentiable modules, BP baselines, NESS-owned
+# data parallelism). `jax` owns its matching jaxlib / CUDA plugin wheels; NESS never pins them.
+jax = ["jax>=0.7.0,<0.11"]
+# Level C: the FabricPC backend. FabricPC implies JAX. The range is the tested 0.6.x API
+# family; a newer minor is NOT silently accepted (see docs/FABRICPC_BACKEND.md).
+# GPU: compose with FabricPC's own hardware extra in ONE resolver call, e.g.
+#   pip install -U "ness[fabricpc]" "fabricpc[cuda12]"
+fabricpc = ["fabricpc>=0.6.0,<0.7"]
+report = ["matplotlib>=3.8", "pandas>=2.0"]
+dev = ["pytest>=8", "jax>=0.7.0,<0.11", "matplotlib>=3.8", "pandas>=2.0"]
+dev-fabricpc = ["pytest>=8", "fabricpc>=0.6.0,<0.7"]
+
+[project.urls]
+Homepage = "https://github.com/guilamacie/NESS"
+Repository = "https://github.com/guilamacie/NESS"
+Issues = "https://github.com/guilamacie/NESS/issues"
+Documentation = "https://github.com/guilamacie/NESS/blob/main/docs/ARCHITECTURE.md"
+"Agent handoff" = "https://github.com/guilamacie/NESS/blob/main/docs/AGENT_HANDOFF.md"
+
+[project.scripts]
+ness = "ness.cli.main:main"
+
+# Reference (toy) plugins register through the SAME entry-point mechanism that
+# third-party plugin packages use. The core registry never hard-codes them.
+[project.entry-points."ness.plugins"]
+toy_temporal_dataset = "ness.reference_plugins.descriptors:TOY_TEMPORAL_DATASET"
+toy_regime_dataset = "ness.reference_plugins.descriptors:TOY_REGIME_DATASET"
+toy_frozen_transformer = "ness.reference_plugins.descriptors:TOY_FROZEN_TRANSFORMER"
+toy_frozen_conv = "ness.reference_plugins.descriptors:TOY_FROZEN_CONV"
+tiny_upper_transformer = "ness.reference_plugins.descriptors:TINY_UPPER_TRANSFORMER"
+tiny_upper_mlp = "ness.reference_plugins.descriptors:TINY_UPPER_MLP"
+simple_temporal_semantics = "ness.reference_plugins.descriptors:SIMPLE_TEMPORAL_SEMANTICS"
+typed_program = "ness.reference_plugins.descriptors:TYPED_PROGRAM"
+exact_finite_regime_reasoner = "ness.reference_plugins.descriptors:EXACT_FINITE_REGIME_REASONER"
+importance_sampling_regime_reasoner = "ness.reference_plugins.descriptors:IMPORTANCE_SAMPLING_REGIME_REASONER"
+analogue_memory_query = "ness.reference_plugins.descriptors:ANALOGUE_MEMORY_QUERY"
+residual_point_cap = "ness.reference_plugins.descriptors:RESIDUAL_POINT_CAP"
+residual_quantile_cap = "ness.reference_plugins.descriptors:RESIDUAL_QUANTILE_CAP"
+point_residual_writer = "ness.reference_plugins.descriptors:POINT_RESIDUAL_WRITER"
+monotone_quantile_writer = "ness.reference_plugins.descriptors:MONOTONE_QUANTILE_WRITER"
+concat_linear_consumer = "ness.reference_plugins.descriptors:CONCAT_LINEAR_CONSUMER"
+point_forecast_task = "ness.reference_plugins.descriptors:POINT_FORECAST_TASK"
+quantile_forecast_task = "ness.reference_plugins.descriptors:QUANTILE_FORECAST_TASK"
+in_memory_snapshot_store = "ness.reference_plugins.descriptors:IN_MEMORY_SNAPSHOT_STORE"
+bp_direct = "ness.reference_plugins.descriptors:BP_DIRECT"
+jax_dense_workspace_cap = "ness.reference_plugins.descriptors:JAX_DENSE_WORKSPACE_CAP"
+fabricpc_residual_cap = "ness.backends.fabricpc.descriptors:FABRICPC_RESIDUAL_CAP"
+fabricpc_pc_local = "ness.backends.fabricpc.descriptors:FABRICPC_PC_LOCAL"
+fabricpc_bp_through_inference = "ness.backends.fabricpc.descriptors:FABRICPC_BP_THROUGH_INFERENCE"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "examples/external_plugin_example/tests"]
+markers = ["gpu: needs a GPU device", "multidevice: needs >= 2 JAX devices", "fabricpc: needs the fabricpc extra"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

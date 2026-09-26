@@ -1,0 +1,34 @@
+# virtual environments and pip scratch
+.venv/
+.venv-gpu/
+.venv-jaxmin/
+.pip_tmp/
+
+# python / packaging artefacts
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# experiment outputs (regenerate with `ness run`; the reference report lives in reports/)
+runs/
+doctor*.json
+
+# LaTeX intermediates (the .tex and .pdf are kept)
+reports/*.aux
+reports/*.log
+reports/*.out
+reports/*.toc
+
+# editor / OS noise
+.DS_Store
+*.swp
+*~
+
+# original design documents: not distributed (available from the project lead)
+NESS_FabricPC_CrossDomain_Design.pdf
+NESS_Initial_Coding_Agent_Prompt.md
+NESS_Coding_Agent_Handoff_Addendum.md

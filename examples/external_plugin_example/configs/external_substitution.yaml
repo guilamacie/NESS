@@ -1,0 +1,43 @@
+# Uses ONLY plugins from ness-example-plugin for the substrate, reasoner and writer, with
+# the core upper module, semantic adapter, program and cap. No core code was edited.
+schema_version: ness.experiment/3
+protocol_id: external_plugin_substitution_v1
+scenario: {plugin: toy_temporal_dataset, config: {n_steps: 600, context: 32, horizon: 4, seed: 1234}}
+tasks:
+  - {id: future_value, plugin: point_forecast_task, config: {horizons: 4, channels: [y0, y1]}}
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 6, max_test_requests: 48}
+arms:
+  external_provider_arm:
+    seed: 0
+    learning: {rule: bp_direct, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - id: base_ts
+          plugin: toy_linear_ar_substrate
+          config: {lags: 4, width: 16, channels: [y0, y1], horizons: 4, seed: 3}
+          inputs: {history: observation://target_history}
+        - id: upper
+          plugin: tiny_upper_mlp
+          config: {in_dim: 16, model_dim: 16}
+          inputs: {main: substrate://base_ts/state/final}
+        - id: semantic
+          plugin: simple_temporal_semantics
+          config: {window: 8, channels: 2, use_neural: true}
+          inputs: {raw: observation://target_history, neural: module://upper/hidden}
+        - id: regime
+          plugin: deterministic_threshold_reasoner
+          config: {states: [calm, volatile], feature_ports: {features: 5}, feature_index: 2, threshold: 0.3}
+          inputs: {features: semantic://semantic/features}
+        - id: cap
+          plugin: residual_point_cap
+          config:
+            channels: [y0, y1]
+            horizons: 4
+            features: {neural: 16, semantic: 5, posterior: 2}
+            writer: {plugin: bounded_point_writer, config: {bound: 0.5}}
+          inputs:
+            baseline: substrate://base_ts/forecast/point
+            neural: module://upper/hidden
+            semantic: semantic://semantic/features
+            posterior: reasoner://regime/posterior
+      output: {task: future_value, from: module://cap/forecast}
