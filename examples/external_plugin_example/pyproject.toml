@@ -16,5 +16,9 @@ deterministic_threshold_reasoner = "ness_example_plugin.descriptors:DETERMINISTI
 bounded_point_writer = "ness_example_plugin.descriptors:BOUNDED_POINT_WRITER"
 heavy_dependency_substrate = "ness_example_plugin.descriptors:HEAVY_DEPENDENCY_SUBSTRATE"
 
+# A typed-program primitive contributed the same way (group ness.primitives).
+[project.entry-points."ness.primitives"]
+window_max = "ness_example_plugin.primitives:WINDOW_MAX"
+
 [tool.setuptools.packages.find]
 where = ["src"]

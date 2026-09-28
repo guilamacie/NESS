@@ -99,11 +99,38 @@ def _event_active_at_origin(events: np.ndarray, horizon: int) -> PrimitiveResult
     return PrimitiveResult(np.array([1.0 if np.any(e[:horizon] > 0.5) else 0.0]), Knownness.KNOWN)
 
 
-def default_registry() -> PrimitiveRegistry:
+PRIMITIVE_ENTRY_POINT_GROUP = "ness.primitives"
+
+
+def load_external_primitives(reg: PrimitiveRegistry, group: str = PRIMITIVE_ENTRY_POINT_GROUP) -> tuple[str, ...]:
+    """Register primitives contributed by installed packages through the ``ness.primitives``
+    entry-point group. Each entry point resolves to a ``PrimitiveSpec`` or an iterable of them.
+    This is how an instance adds operators to typed programs without touching core; a broken
+    entry point is a ``ContractViolation`` naming it (never silently skipped)."""
+    from importlib.metadata import entry_points
+    loaded: list[str] = []
+    for ep in entry_points(group=group):
+        try:
+            obj = ep.load()
+        except Exception as exc:  # noqa: BLE001 - the name of the offending entry point matters more than the type
+            raise ContractViolation(f"primitive entry point {ep.name!r} ({ep.value}) failed to load: {type(exc).__name__}: {exc}") from exc
+        specs = [obj] if isinstance(obj, PrimitiveSpec) else list(obj)
+        for spec in specs:
+            if not isinstance(spec, PrimitiveSpec):
+                raise ContractViolation(f"primitive entry point {ep.name!r} must yield PrimitiveSpec objects, got {type(spec).__name__}")
+            reg.register(spec)
+            loaded.append(spec.name)
+    return tuple(loaded)
+
+
+def default_registry(include_external: bool = True) -> PrimitiveRegistry:
+    """Built-in primitives plus, by default, those installed packages contribute (entry points)."""
     reg = PrimitiveRegistry()
     reg.register(PrimitiveSpec("window_slope", {"series": "numeric_series", "window": "int"}, "numeric_vector", "1", "pure", "inputs", False, 4, _window_slope, "trailing OLS slope per channel (value/step)"))
     reg.register(PrimitiveSpec("window_mean", {"series": "numeric_series", "window": "int"}, "numeric_vector", "1", "pure", "inputs", False, 2, _window_mean, "trailing mean per channel"))
     reg.register(PrimitiveSpec("last_value", {"series": "numeric_series"}, "numeric_vector", "1", "pure", "inputs", False, 1, _last_value, "last observed value per channel"))
     reg.register(PrimitiveSpec("event_active_at_origin", {"events": "numeric_series", "horizon": "int"}, "numeric_vector", "1", "pure", "inputs", False, 1, _event_active_at_origin,
                                "bounded event predicate over the known-future window at the origin"))
+    if include_external:
+        load_external_primitives(reg)
     return reg

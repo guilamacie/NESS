@@ -142,9 +142,13 @@ def cmd_plugins(args: argparse.Namespace) -> int:
 
 def cmd_audit(args: argparse.Namespace) -> int:
     from ..inference import INFERENCE_PROFILES
+    from ..integrity import check_core_integrity
     from ..learning import LEARNING_PROFILES
     from ..runtime.system import dependency_lock
     print(f"ness {__version__}")
+    integrity = check_core_integrity()
+    print("core integrity:")
+    print("  " + integrity.summary().replace("\n", "\n  "))
     print("dependency lock:")
     for k, v in dependency_lock().items():
         print(f"  {k:10s} {v}")
@@ -156,6 +160,9 @@ def cmd_audit(args: argparse.Namespace) -> int:
         print(f"  {c.name:26s} {c.status.value:12s} {c.evidence}")
     reg = _registry()
     print(f"plugins discovered: {len(reg.ids())}  (kinds: {sorted(set(d.kind for d in reg.descriptors()))})")
+    if getattr(args, "strict", False) and integrity.matches is False:
+        print("error: core sources differ from the release baseline (audit --strict)", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -205,7 +212,8 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("root")
     i.add_argument("manifest", nargs="?")
     i.set_defaults(fn=cmd_inspect)
-    a = sub.add_parser("audit", help="dependency locks and capability status")
+    a = sub.add_parser("audit", help="core-source integrity (release baseline), dependency locks and capability status")
+    a.add_argument("--strict", action="store_true", help="exit 1 when the core sources differ from the release baseline")
     a.set_defaults(fn=cmd_audit)
     pl = sub.add_parser("plugins", help="list discovered plugins")
     pl.set_defaults(fn=cmd_plugins)

@@ -12,7 +12,7 @@ architecture decision record in `docs/decisions/`.
 |---|---|
 | run and configure your first experiments | `docs/QUICKSTART.md`, `examples/quickstart/` |
 | understand the architecture and interfaces | `docs/ARCHITECTURE.md` |
-| plug your own models into the layers | `docs/AGENT_HANDOFF.md` (written for humans and AI coding agents) |
+| plug your own models into the layers, without touching core | `docs/AGENT_HANDOFF.md` (written for humans and AI coding agents; states exactly which files an instance may create and which it must never modify) |
 | write and test a plugin package | `docs/CONTRIBUTING_PLUGINS.md`, `examples/external_plugin_example/` |
 | wire modules together | `docs/COMPOSITION_GRAPH.md` |
 | use or extend the FabricPC backend | `docs/FABRICPC_BACKEND.md`, `docs/FABRICPC_UPGRADE.md`, `compat/` |
@@ -41,6 +41,12 @@ python -m pytest -p no:cacheprovider             # jax/fabricpc/GPU tests skip t
 * Never report a positive scientific result that the saved artifacts do not support; failed
   runs and substitutions stay in the logs and the report.
 * Keep test file basenames unique across `tests/` subdirectories.
+* Any change under `src/ness/` (except reference plugins) must be followed by
+  `python tools/update_core_hash.py`, which regenerates the release baseline in
+  `src/ness/_core_hash.py`; `tests/test_core_hash.py` fails otherwise. `ness audit` compares the
+  installed core against that baseline, which is how instance implementers prove they did not
+  modify the platform. Instances (plugins, datasets, configurations) live in their own packages,
+  never inside `src/ness/`: see `docs/AGENT_HANDOFF.md` §1.
 
 ## Pull requests
 

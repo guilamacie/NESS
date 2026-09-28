@@ -485,7 +485,7 @@ write-up shipped in `reports/`.
 | `ness report <dir> [--title]` | metrics, figures and the Markdown report from saved artifacts |
 | `ness graph <config> [--out] [--arms] [--spec-only] [--no-substitutions] [--format] [--dpi]` | diagrams of the configuration (needs `ness[report]`) |
 | `ness inspect <checkpoints dir> [<manifest-id>]` | manifests; components, wiring, algorithm specs of one |
-| `ness audit` | dependency locks and capability status |
+| `ness audit [--strict]` | core-source integrity against the release baseline (`--strict`: non-zero exit on a mismatch), dependency locks and capability status |
 | `ness plugins` | every discovered plugin with kind, version, provider, missing dependencies |
 | `ness doctor [--backend] [--platform] [--json]` | versions, bootstrap order, devices, probed capabilities |
 
@@ -527,6 +527,7 @@ show the intended usage. Core changes go through an ADR in `docs/decisions/`.
 | paired, identical request streams; controls first | shared scenario in the runner; native and same-fact control arms in the reference study |
 | memory is pinned per prediction, published between updates, optional by default | `MemoryView`; learner branch; `MemoryAttachment` only when configured |
 | plugins register through entry points; the core never names them | `PluginRegistry.discover`; reference plugins use the same mechanism |
+| instances never modify core | `ness.integrity`: a release baseline hash of the core sources; `ness audit --strict` fails on any modified core; `tests/test_core_hash.py` fails on core changes without a baseline update; `docs/AGENT_HANDOFF.md` §1 lists the file boundary |
 
 The decisions behind these rules are recorded as ADRs in `docs/decisions/` (one execution
 verb, substrates as explicit nodes, memory pinning and publication, and others).

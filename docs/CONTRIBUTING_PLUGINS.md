@@ -65,3 +65,4 @@ descriptor + implementation + deterministic fixture (`initialize` from a seed) +
 + a config fragment showing how it is wired + documentation of its capabilities and
 limitations. If it cannot register and run without editing `src/ness`, the plugin (or the core
 API) is not finished - open an issue against the core rather than patching it locally.
+* The plugin package modifies nothing under `src/ness/`; `ness audit --strict` passes in its environment (see `docs/AGENT_HANDOFF.md` §1 for the file boundary).

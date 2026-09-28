@@ -8,7 +8,7 @@ pip install "ness @ git+https://github.com/guilamacie/NESS.git"                #
 pip install "ness[jax] @ git+https://github.com/guilamacie/NESS.git"           # + NESS JAX backend
 pip install "ness[fabricpc] @ git+https://github.com/guilamacie/NESS.git"      # + FabricPC 0.6.x backend
 pip install "ness[report] @ git+https://github.com/guilamacie/NESS.git"        # + report tooling
-pip install "ness @ git+https://github.com/guilamacie/NESS.git@v0.2.0"         # a tagged release
+pip install "ness @ git+https://github.com/guilamacie/NESS.git@v0.2.1"         # a tagged release
 ```
 
 NESS has three installation levels. Each level is a superset of the previous one.

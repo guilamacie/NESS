@@ -93,16 +93,9 @@ class ExperimentReport:
 
 # ---------------------------------------------------------------------------- helpers
 def core_source_hash(package_dir: Path | None = None) -> str:
-    """sha256 over the core package sources: proves arms and substitutions ran on identical core code."""
-    import ness
-    root = package_dir or Path(ness.__file__).parent
-    h = hashlib.sha256()
-    for p in sorted(root.rglob("*.py")):
-        if "__pycache__" in p.parts or "reference_plugins" in p.parts:
-            continue
-        h.update(str(p.relative_to(root)).encode())
-        h.update(p.read_bytes())
-    return h.hexdigest()
+    """sha256 over the core package sources (see ``ness.integrity``): proves arms and substitutions ran on identical core code."""
+    from ..integrity import core_source_hash as _h
+    return _h(package_dir)
 
 
 def _aggregate(agg: dict[str, dict[str, float]], rows: list[dict[str, Any]], task_ids: list[str]) -> dict[str, dict[str, float]]:

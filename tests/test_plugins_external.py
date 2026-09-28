@@ -52,3 +52,23 @@ def test_external_substrate_reasoner_and_writer_compose_with_core_modules(regist
     post = rec.port_values[("regime", "posterior")].payload
     assert post.weight_semantics == "deterministic_assignment" and sysm.compiled.node("cap").module.writer.writer_id == "bounded_point_writer"
     assert res.diagnostics["node_versions"]["base_ts"] == ("toy_linear_ar_substrate", "0.1.0")
+
+
+def test_third_party_program_primitive_via_entry_point():
+    """T41 for symbolic operators: the example package contributes `window_max` through the
+    `ness.primitives` entry point; the default registry sees it, the interpreter can call it, and
+    core has no mention of it."""
+    import importlib.util
+    import numpy as np
+    from ness.symbolic.operators import default_registry
+
+    if importlib.util.find_spec("ness_example_plugin") is None:
+        import pytest
+        pytest.skip("example plugin not installed")
+    reg = default_registry()
+    assert "window_max" in reg.names()
+    assert "window_max" not in default_registry(include_external=False).names()
+    res = reg.get("window_max").fn(np.array([[1.0, 5.0], [3.0, 2.0], [2.0, 4.0]]), 2)
+    from ness.contracts import Knownness
+    assert res.knownness == Knownness.KNOWN and np.allclose(res.value, [3.0, 4.0])
+    assert reg.get("window_max").fn(np.zeros((1, 2)), 3).knownness == Knownness.MISSING   # preconditions fail -> MISSING, never a fabricated value

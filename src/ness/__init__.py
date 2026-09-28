@@ -11,7 +11,7 @@ The package is organised by dependency direction (see docs/ARCHITECTURE.md):
 ``ness.contracts`` imports neither FabricPC, Hyperon, JAX nor any modality framework.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 CONTRACT_VERSION = "ness.contracts/1"
 COMPOSITION_SCHEMA = "ness.composition/1"

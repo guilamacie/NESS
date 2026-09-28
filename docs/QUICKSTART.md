@@ -552,10 +552,12 @@ point in your package:
 my_substrate = "my_package.descriptors:MY_SUBSTRATE"   # PluginDescriptor(id, kind, version, "module:Class", requires, summary)
 ```
 
-Start from `examples/external_plugin_example/` (a substrate, a reasoner, a writer and a
-heavy-dependency plugin, with tests built on `ness.plugin_api.testkit`), then follow
-[`AGENT_HANDOFF.md`](AGENT_HANDOFF.md), which walks through one plugin per layer with the
-contracts each must honour, and [`CONTRIBUTING_PLUGINS.md`](CONTRIBUTING_PLUGINS.md) for the
+Your models and data live in **your own package**; the platform is a dependency you install and
+never edit (`ness audit --strict` proves the installed core matches the release). Start from
+`examples/external_plugin_example/` (a substrate, a reasoner, a writer and a heavy-dependency
+plugin, with tests built on `ness.plugin_api.testkit`), then follow
+[`AGENT_HANDOFF.md`](AGENT_HANDOFF.md), which states exactly which files an instance may create
+and must never modify and walks through one plugin per layer with the contracts each must honour, and [`CONTRIBUTING_PLUGINS.md`](CONTRIBUTING_PLUGINS.md) for the
 lifecycle and state rules. Wrapping a real frozen model means implementing a `substrate` that
 exposes `state/*` and `forecast/*` ports with `Differentiability.STOP` and a frozen parameter
 group; the port contract, not the library, is what the rest of the system sees.
