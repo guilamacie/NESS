@@ -52,6 +52,7 @@ pip install -e ".[fabricpc]"                      # Level C: FabricPC 0.6.x back
 pip install -U -e ".[fabricpc]" "fabricpc[cuda12]" # GPU: compose with FabricPC's hardware extra (Linux)
 pip install -e examples/external_plugin_example   # optional third-party plugin example
 ness doctor --backend fabricpc --json doctor.json  # versions, bootstrap order, devices, probed capabilities
+ness graph examples/vertical_slice_timeseries/configs/toy_vertical_slice.yaml --out graphs/toy   # diagrams of every arm (needs ness[report])
 ness validate examples/vertical_slice_timeseries/configs/vertical_slice.yaml
 ness run examples/vertical_slice_timeseries/configs/vertical_slice.yaml --out runs/vertical_slice
 ness run examples/fabricpc_workspace/configs/fabricpc_arms.yaml --out runs/fabricpc

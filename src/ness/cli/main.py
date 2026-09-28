@@ -64,6 +64,17 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_graph(args: argparse.Namespace) -> int:
+    from ..visualize import render_experiment
+    written, notes = render_experiment(args.config, args.out, args.arms or None, spec_only=args.spec_only, fmt=args.format, dpi=args.dpi,
+                                       include_substitutions=not args.no_substitutions)
+    for n in notes:
+        print(f"note: {n}")
+    for w in written:
+        print(w)
+    return 0
+
+
 def cmd_evaluate(args: argparse.Namespace) -> int:
     p = Path(args.report)
     if p.is_dir():
@@ -181,6 +192,15 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("run_dir")
     rp.add_argument("--title", default="NESS toy vertical slice - run report")
     rp.set_defaults(fn=cmd_report)
+    g = sub.add_parser("graph", help="draw an experiment: composition graph and sandwich view per arm, arms matrix, data-access map (needs ness[report])")
+    g.add_argument("config")
+    g.add_argument("--out", default=None, help="output directory (default graphs/<protocol_id>)")
+    g.add_argument("--arms", nargs="*", default=None, help="draw only these arms (substitutions are then skipped)")
+    g.add_argument("--spec-only", action="store_true", help="never instantiate plugins: draw from the configuration alone")
+    g.add_argument("--no-substitutions", action="store_true", help="leave substitution proofs out of the arms matrix")
+    g.add_argument("--format", default="png", choices=["png", "svg", "pdf"])
+    g.add_argument("--dpi", type=int, default=150)
+    g.set_defaults(fn=cmd_graph)
     i = sub.add_parser("inspect", help="inspect a checkpoint store / manifest")
     i.add_argument("root")
     i.add_argument("manifest", nargs="?")

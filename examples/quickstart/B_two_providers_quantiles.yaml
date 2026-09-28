@@ -1,0 +1,131 @@
+# Architecture B: two frozen providers, one workspace, quantile output.
+# Shows: several substrates in one arm, a cross-provider merge, a sampled reasoner, memory, and a
+# quantile prediction space. Validates and runs with `ness[jax]` (+ the external plugin example
+# for the writer used in the second arm).
+schema_version: ness.experiment/3
+protocol_id: arch_B_two_providers_quantiles
+
+runtime: {backend: auto, platform: cpu}
+
+scenario:
+  plugin: toy_temporal_dataset
+  config: {n_steps: 600, context: 32, horizon: 4, seed: 4321, train_fraction: 0.7}
+
+tasks:
+  - id: future_quantiles
+    plugin: quantile_forecast_task
+    config: {horizons: 4, channels: [y0, y1], levels: [0.1, 0.5, 0.9], memory_namespaces: [episodes]}
+
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 16, seeds: [0, 1], max_test_requests: 96}
+
+# ---- two lower providers with the same port contract (state/early, state/final, forecast/*) ----
+x-provider-a: &provider_a
+  id: prov_a
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7, pretrain_steps: 300, quantile_levels: [0.1, 0.5, 0.9]}
+  inputs: {history: observation://target_history}
+
+x-provider-b: &provider_b
+  id: prov_b
+  plugin: toy_frozen_conv
+  config: {width: 16, kernel: 3, layers: 2, channels: [y0, y1], horizons: 4, seed: 11, pretrain_steps: 300}
+  inputs: {history: observation://target_history}
+
+# ---- one upper module reading both providers: explicit merge, learned projection of B ----
+x-upper: &upper
+  id: upper
+  plugin: tiny_upper_transformer
+  config: {in_dim: 16, model_dim: 16, heads: 2}
+  inputs:
+    main:
+      merge: weighted_sum                                         # learned softmax weights over the two sources
+      sources:
+        - substrate://prov_a/state/final
+        - {from: substrate://prov_b/state/final, boundary: [{kind: linear, out_dim: 16}]}
+      post: [{kind: rms_norm}]
+
+x-semantic: &semantic
+  id: semantic
+  plugin: simple_temporal_semantics
+  config: {window: 8, channels: 2, cross_lag_corr: [1], use_neural: true}   # 6 features: slopes(2), vols(2), xcorr(1), neural cue(1)
+  inputs: {raw: observation://target_history, neural: module://upper/hidden}
+
+x-regime: &regime                                                   # sampled reasoner: approximate posterior with ESS diagnostics
+  id: regime
+  plugin: importance_sampling_regime_reasoner
+  config:
+    samples: 2000
+    feature_ports: {semantic: 6}
+    model:
+      latent_name: regime
+      states: [calm, volatile]
+      prior: [0.5, 0.5]
+      emission:
+        family: gaussian_diag
+        means:  [[0.0, 0.0, 0.15, 0.10, 0.0, 0.0], [0.0, 0.0, 0.45, 0.25, 0.0, 0.0]]
+        scales: [[0.3, 0.3, 0.10, 0.08, 0.5, 1.0], [0.3, 0.3, 0.20, 0.15, 0.5, 1.0]]
+  inputs: {semantic: semantic://semantic/features}
+
+x-memory-query: &memory_query
+  id: analogues
+  plugin: analogue_memory_query
+  config: {store: episodes, namespace: episodes, k: 5, horizon: 4, channels: 2}
+  inputs: {query: observation://target_history}
+
+x-memory: &memory
+  name: episodes
+  store: {plugin: in_memory_snapshot_store}
+  namespace: episodes
+  seed_from_scenario: true
+  learner_appends: true
+  episode_window_field: target_history
+
+x-learning: &learning {rule: bp_direct, optimizer: {kind: adam, lr: 0.002, clip_norm: 5.0}}
+
+arms:
+  provider_a_native:
+    description: provider A's own quantiles (control)
+    seed: 0
+    composition: {nodes: [*provider_a], output: {task: future_quantiles, from: substrate://prov_a/forecast/quantiles}}
+
+  two_provider_quantile_cap:
+    description: both providers -> upper (weighted_sum) -> semantic + sampled reasoner + memory -> monotone quantile cap
+    seed: 0
+    learning: *learning
+    memory: *memory
+    composition:
+      nodes:
+        - *provider_a
+        - *provider_b
+        - *upper
+        - *semantic
+        - *regime
+        - *memory_query
+        - id: cap
+          plugin: residual_quantile_cap                             # writer defaults to monotone_quantile_writer
+          config: {channels: [y0, y1], horizons: 4, levels: [0.1, 0.5, 0.9], features: {neural: 16, semantic: 6, posterior: 2, memory: 8}}
+          inputs:
+            baseline: substrate://prov_a/forecast/quantiles
+            neural: module://upper/hidden
+            semantic: semantic://semantic/features
+            posterior: reasoner://regime/posterior
+            memory: memory://analogues/evidence
+      output: {task: future_quantiles, from: module://cap/forecast}
+
+  two_provider_no_symbolic:
+    description: same-fact neural control; both providers, no symbolic layer, no memory
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *provider_a
+        - *provider_b
+        - *upper
+        - id: cap
+          plugin: residual_quantile_cap
+          config: {channels: [y0, y1], horizons: 4, levels: [0.1, 0.5, 0.9], features: {neural: 16, raw_window: 64}}
+          inputs:
+            baseline: substrate://prov_a/forecast/quantiles
+            neural: module://upper/hidden
+            raw_window: {from: observation://target_history, boundary: [flatten]}
+      output: {task: future_quantiles, from: module://cap/forecast}

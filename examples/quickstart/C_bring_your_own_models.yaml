@@ -1,0 +1,139 @@
+# Architecture C: bring your own models. A TEMPLATE, not a runnable file: the plugin ids below
+# (my_*) are the ones YOU write in your own package (docs/AGENT_HANDOFF.md, one section per
+# layer). `ness graph --spec-only` draws it as is; `ness validate` will run once the plugins exist.
+schema_version: ness.experiment/3
+protocol_id: arch_C_bring_your_own_models
+
+runtime: {backend: fabricpc, platform: gpu, devices: {platform: gpu, selection: all, fallback: cpu}, x64: true, profile: scientific}
+
+scenario:
+  plugin: my_energy_market_dataset                                 # kind `scenario`: ScenarioProvider over your data
+  config: {path: data/market.parquet, context: 168, horizon: 24, calendar: true, splits: [0.7, 0.1, 0.2]}
+
+tasks:
+  - id: day_ahead_load
+    plugin: quantile_forecast_task
+    config: {horizons: 24, channels: [load], levels: [0.05, 0.5, 0.95], memory_namespaces: [episodes]}
+
+protocol: {train_split: train, test_split: test, batch_size: 32, updates: 500, seeds: [0, 1, 2], restore_check_requests: 32}
+
+x-foundation: &foundation                                           # frozen foundation forecaster wrapped as a substrate
+  id: fm
+  plugin: my_timesfm_substrate                                      # exposes state/final, forecast/point, forecast/quantiles; STOP gradient
+  config: {checkpoint: timesfm-3-500m, horizon: 24, quantile_levels: [0.05, 0.5, 0.95], device: gpu}
+  inputs: {history: observation://load_history}
+
+x-weather: &weather                                                 # a second, small frozen encoder over exogenous inputs
+  id: weather
+  plugin: my_weather_encoder_substrate
+  config: {channels: [temp, wind, solar], width: 32}
+  inputs: {history: observation://weather_history}
+
+x-upper: &upper                                                     # your trainable module (jax runtime, implements apply())
+  id: upper
+  plugin: my_gru_upper_module
+  config: {in_dim: 32, model_dim: 32}
+  inputs:
+    main:
+      merge: cross_attention                                        # queries from the foundation state, keys/values from weather
+      sources:
+        - {from: substrate://fm/state/final, boundary: [{kind: linear, out_dim: 32}]}
+        - substrate://weather/state/final
+      post: [{kind: layer_norm}]
+
+x-calendar: &calendar                                               # semantic adapter reading known-future calendar/events
+  id: calendar
+  plugin: my_calendar_semantics
+  config: {holidays: true, hour_of_day: true}
+  inputs: {events: observation://calendar_future, raw: observation://load_history}
+
+x-peak-program: &peak_program                                       # a typed program over the raw series (reference interpreter)
+  id: peak_program
+  plugin: typed_program
+  config:
+    output_dim: 2
+    port_bindings: {series: {port: series, dim: 1}}
+    constants: {window: 24}
+    program:
+      schema_version: ness.program/1
+      name: daily_peak_slope
+      semantics: typed_numeric_v1
+      example_status: illustrative_proposed
+      inputs: {series: numeric_series, window: int}
+      output: numeric_vector
+      body: {op: call, primitive: window_slope, args: {series: {op: input, name: series}, window: {op: input, name: window}}}
+  inputs: {series: observation://load_history}
+
+x-regime: &regime                                                   # your NumPyro/Pyro reasoner behind the reasoner contract
+  id: regime
+  plugin: my_numpyro_regime_reasoner
+  config: {states: [normal, heatwave, outage], samples: 4000, feature_ports: {calendar: 6, peak: 2}}
+  inputs: {calendar: semantic://calendar/features, peak: program://peak_program/value}
+
+x-memory-query: &memory_query
+  id: analogues
+  plugin: analogue_memory_query                                     # the reference query works against any MemoryStore
+  config: {store: episodes, namespace: episodes, k: 10, horizon: 24, channels: 1}
+  inputs: {query: observation://load_history}
+
+x-memory: &memory
+  name: episodes
+  store: {plugin: my_hyperon_memory_store, config: {atomspace: data/atomspace.db}}   # your MemoryStore implementation
+  namespace: episodes
+  seed_from_scenario: true
+  learner_appends: true
+  episode_window_field: load_history
+
+arms:
+  foundation_native:
+    description: the foundation model's own quantiles (control)
+    seed: 0
+    composition: {nodes: [*foundation], output: {task: day_ahead_load, from: substrate://fm/forecast/quantiles}}
+
+  full_pc_workspace:
+    description: everything above -> FabricPC quantile cap with sPC inference and a local PC learning rule
+    seed: 0
+    inference: {profile: fabricpc_spc}
+    learning: {rule: fabricpc_pc_local, optimizer: {kind: adam, lr: 0.001}}
+    memory: *memory
+    composition:
+      nodes:
+        - *foundation
+        - *weather
+        - *upper
+        - *calendar
+        - *peak_program
+        - *regime
+        - *memory_query
+        - id: cap
+          plugin: my_fabricpc_quantile_cap                          # a FabricPC workspace writing monotone quantile corrections
+          config: {channels: [load], horizons: 24, levels: [0.05, 0.5, 0.95], hidden: [64, 32],
+                   features: {neural: 32, calendar: 6, peak: 2, posterior: 3, memory: 24},
+                   inference: {profile: fabricpc_spc, eta_infer: 0.05, infer_steps: 30}}
+          inputs:
+            baseline: substrate://fm/forecast/quantiles
+            neural: {from: module://upper/hidden, boundary: [mean_pool]}   # parameter-free boundary into the FabricPC runtime
+            calendar: semantic://calendar/features
+            peak: program://peak_program/value
+            posterior: reasoner://regime/posterior
+            memory: memory://analogues/evidence
+      output: {task: day_ahead_load, from: module://cap/forecast}
+
+  same_fact_neural_control:
+    description: the same permitted facts (calendar, raw window) fed to a plain BP cap; no symbolic composition
+    seed: 0
+    learning: {rule: bp_direct, optimizer: {kind: adam, lr: 0.001}}
+    composition:
+      nodes:
+        - *foundation
+        - *weather
+        - *upper
+        - id: cap
+          plugin: residual_quantile_cap
+          config: {channels: [load], horizons: 24, levels: [0.05, 0.5, 0.95], features: {neural: 32, calendar_raw: 48, raw_window: 168}}
+          inputs:
+            baseline: substrate://fm/forecast/quantiles
+            neural: module://upper/hidden
+            calendar_raw: {from: observation://calendar_future, boundary: [flatten]}
+            raw_window: {from: observation://load_history, boundary: [flatten]}
+      output: {task: day_ahead_load, from: module://cap/forecast}
