@@ -1,0 +1,86 @@
+# Quick start 05: plugins from another package, and substitution proofs. The substrate, the
+# reasoner and the cap's writer below come from `examples/external_plugin_example` (a separate
+# pip package registered through the `ness.plugins` entry point). Nothing in ness core knows them.
+schema_version: ness.experiment/3
+protocol_id: quickstart_05_external_plugin
+
+scenario:
+  plugin: toy_temporal_dataset
+  config: {n_steps: 400, context: 32, horizon: 4, seed: 1234, train_fraction: 0.7}
+
+tasks:
+  - {id: future_value, plugin: point_forecast_task, config: {horizons: 4, channels: [y0, y1]}}
+
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 6, max_test_requests: 48}
+
+x-base-ar: &base_ar                                               # third-party lower provider, same port contract
+  id: base_ts
+  plugin: toy_linear_ar_substrate
+  config: {lags: 4, width: 16, channels: [y0, y1], horizons: 4, seed: 3}
+  inputs: {history: observation://target_history}
+
+x-base-core: &base_core                                           # core provider with the same ports
+  id: base_ts
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7, pretrain_steps: 200}
+  inputs: {history: observation://target_history}
+
+x-upper: &upper
+  id: upper
+  plugin: tiny_upper_mlp
+  config: {in_dim: 16, model_dim: 16, hidden_dim: 32}
+  inputs: {main: substrate://base_ts/state/final}
+
+x-semantic: &semantic
+  id: semantic
+  plugin: simple_temporal_semantics
+  config: {window: 8, channels: 2, use_neural: false}             # 4 features: slopes(2), volatilities(2)
+  inputs: {raw: observation://target_history}
+
+x-regime: &regime                                                 # third-party reasoner: one-hot regime by threshold
+  id: regime
+  plugin: deterministic_threshold_reasoner
+  config: {states: [volatile, calm], feature_ports: {features: 4}, feature_index: 2, threshold: 0.3}
+  inputs: {features: semantic://semantic/features}
+
+x-cap: &cap
+  id: cap
+  plugin: residual_point_cap
+  config: {channels: [y0, y1], horizons: 4, features: {neural: 16, posterior: 2}, writer: bounded_point_writer}   # third-party writer
+  inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden, posterior: reasoner://regime/posterior}
+
+x-learning: &learning {rule: bp_direct, optimizer: {kind: adam, lr: 0.003}}
+
+arms:
+  ar_native:
+    seed: 0
+    composition: {nodes: [*base_ar], output: {task: future_value, from: substrate://base_ts/forecast/point}}
+  ar_cap:
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base_ar, *upper, *semantic, *regime, *cap], output: {task: future_value, from: module://cap/forecast}}
+
+# Substitution proofs: complete arms that must validate, predict target-free, pass the causal
+# check, take one update and restore from checkpoint. `ness run` records them in
+# metrics/substitution_matrix.*; `ness run --only-substitutions` refreshes just these.
+substitutions:
+  - id: S_core_provider
+    description: third-party AR provider -> core frozen transformer, everything else unchanged
+    seed: 0
+    learning: *learning
+    composition: {nodes: [*base_core, *upper, *semantic, *regime, *cap], output: {task: future_value, from: module://cap/forecast}}
+  - id: S_exact_reasoner
+    description: threshold reasoner -> exact finite reasoner over the same 4 features
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base_ar
+        - *upper
+        - *semantic
+        - {id: regime, plugin: exact_finite_regime_reasoner,
+           config: {feature_ports: {features: 4}, model: {latent_name: regime, states: [calm, volatile], prior: [0.5, 0.5],
+                    emission: {family: gaussian_diag, means: [[0.0, 0.0, 0.15, 0.10], [0.0, 0.0, 0.45, 0.25]], scales: [[0.3, 0.3, 0.10, 0.08], [0.3, 0.3, 0.20, 0.15]]}}},
+           inputs: {features: semantic://semantic/features}}
+        - *cap
+      output: {task: future_value, from: module://cap/forecast}

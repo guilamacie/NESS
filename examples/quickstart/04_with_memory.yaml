@@ -1,0 +1,72 @@
+# Quick start 04: pinned analogue memory. The arm attaches a memory store; a memory-query node
+# reads a *pinned, causally filtered view* of it and lowers the top-k matured episodes to typed
+# evidence that the cap consumes like any other feature. Omit the `memory:` section and the
+# query node and the arm is exactly quick start 03.
+schema_version: ness.experiment/3
+protocol_id: quickstart_04_with_memory
+
+scenario:
+  plugin: toy_temporal_dataset
+  config: {n_steps: 400, context: 32, horizon: 4, seed: 1234, train_fraction: 0.7}
+
+tasks:
+  - id: future_value
+    plugin: point_forecast_task
+    config: {horizons: 4, channels: [y0, y1], memory_namespaces: [episodes]}   # the task's access policy names permitted namespaces
+
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 8, max_test_requests: 48}
+
+x-base: &base
+  id: base_ts
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7, pretrain_steps: 200}
+  inputs: {history: observation://target_history}
+
+x-upper: &upper
+  id: upper
+  plugin: tiny_upper_transformer
+  config: {in_dim: 16, model_dim: 16, heads: 2}
+  inputs: {main: substrate://base_ts/state/final}
+
+x-memory-query: &memory_query
+  id: analogues
+  plugin: analogue_memory_query                                   # kind `memory_query`; reads ctx.memory_views[store] only
+  config: {store: episodes, namespace: episodes, k: 3, horizon: 4, channels: 2}   # evidence dim = horizon x channels = 8
+  inputs: {query: observation://target_history}
+
+x-memory: &memory                                                 # attached per arm; absent = no memory at all
+  name: episodes                                                  # the name memory-query nodes refer to in `store:`
+  store: {plugin: in_memory_snapshot_store}                       # any plugin of kind `memory_store`
+  namespace: episodes
+  seed_from_scenario: true                                        # initial snapshot = episodes matured before the first train origin
+  learner_appends: true                                           # the learner branch appends revealed episodes; published between updates only
+  episode_window_field: target_history
+
+arms:
+  native_baseline:
+    seed: 0
+    composition: {nodes: [*base], output: {task: future_value, from: substrate://base_ts/forecast/point}}
+
+  neural_cap:
+    seed: 0
+    learning: {rule: bp_direct, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - *base
+        - *upper
+        - {id: cap, plugin: residual_point_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16}},
+           inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden}}
+      output: {task: future_value, from: module://cap/forecast}
+
+  neural_cap_with_memory:
+    seed: 0
+    learning: {rule: bp_direct, optimizer: {kind: adam, lr: 0.003}}
+    memory: *memory
+    composition:
+      nodes:
+        - *base
+        - *upper
+        - *memory_query
+        - {id: cap, plugin: residual_point_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16, memory: 8}},
+           inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden, memory: memory://analogues/evidence}}
+      output: {task: future_value, from: module://cap/forecast}

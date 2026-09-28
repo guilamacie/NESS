@@ -10,6 +10,7 @@ architecture decision record in `docs/decisions/`.
 
 | you want to | read |
 |---|---|
+| run and configure your first experiments | `docs/QUICKSTART.md`, `examples/quickstart/` |
 | understand the architecture and interfaces | `docs/ARCHITECTURE.md` |
 | plug your own models into the layers | `docs/AGENT_HANDOFF.md` (written for humans and AI coding agents) |
 | write and test a plugin package | `docs/CONTRIBUTING_PLUGINS.md`, `examples/external_plugin_example/` |

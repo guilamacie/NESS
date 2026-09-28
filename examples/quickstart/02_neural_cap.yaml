@@ -1,0 +1,53 @@
+# Quick start 02: frozen substrate -> trainable upper module -> residual cap. The cap adds a
+# learned correction to the frozen forecast; at initialisation it reproduces the baseline exactly.
+schema_version: ness.experiment/3
+protocol_id: quickstart_02_neural_cap
+
+runtime: {backend: auto, platform: cpu}                          # auto = the least capable backend the arms need (jax here)
+
+scenario:
+  plugin: toy_temporal_dataset
+  config: {n_steps: 400, context: 32, horizon: 4, seed: 1234, train_fraction: 0.7}
+
+tasks:
+  - id: future_value
+    plugin: point_forecast_task
+    config: {horizons: 4, channels: [y0, y1]}
+
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 8, max_test_requests: 48}
+
+x-base: &base
+  id: base_ts
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7, pretrain_steps: 200}
+  inputs: {history: observation://target_history}
+
+arms:
+  native_baseline:
+    seed: 0
+    composition: {nodes: [*base], output: {task: future_value, from: substrate://base_ts/forecast/point}}
+
+  neural_cap:
+    description: upper transformer over the substrate's final state (+ projected early state) -> residual point cap
+    seed: 0
+    learning: {rule: bp_direct, optimizer: {kind: adam, lr: 0.003, clip_norm: 5.0}}   # required as soon as a node is trainable
+    composition:
+      nodes:
+        - *base
+        - id: upper
+          plugin: tiny_upper_transformer                         # kind `upper_module`, runtime jax, trainable
+          config: {in_dim: 16, model_dim: 16, heads: 2}
+          inputs:
+            main:                                                # two sources need an explicit merge
+              merge: gated_add
+              sources:
+                - substrate://base_ts/state/final
+                - {from: substrate://base_ts/state/early, boundary: [{kind: linear, out_dim: 16}]}   # learned edge parameters
+              post: [{kind: layer_norm}]
+        - id: cap
+          plugin: residual_point_cap                             # kind `cap`: baseline + consumer(features) -> forecast
+          config: {channels: [y0, y1], horizons: 4, features: {neural: 16}}   # every feature port declares its dimension
+          inputs:
+            baseline: substrate://base_ts/forecast/point
+            neural: module://upper/hidden
+      output: {task: future_value, from: module://cap/forecast}

@@ -1,0 +1,96 @@
+# Quick start 03: adds the symbolic middle: a semantic adapter (typed features from raw data and
+# the upper state), a typed program (interpreted, fuel-bounded) and an exact probabilistic
+# reasoner whose posterior enters the cap as HypothesisEvidence.
+schema_version: ness.experiment/3
+protocol_id: quickstart_03_symbolic_probabilistic
+
+scenario:
+  plugin: toy_temporal_dataset
+  config: {n_steps: 400, context: 32, horizon: 4, seed: 1234, train_fraction: 0.7}
+
+tasks:
+  - id: future_value
+    plugin: point_forecast_task
+    config: {horizons: 4, channels: [y0, y1]}
+
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 8, max_test_requests: 48}
+
+x-base: &base
+  id: base_ts
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7, pretrain_steps: 200}
+  inputs: {history: observation://target_history}
+
+x-upper: &upper
+  id: upper
+  plugin: tiny_upper_transformer
+  config: {in_dim: 16, model_dim: 16, heads: 2}
+  inputs: {main: substrate://base_ts/state/final}
+
+x-semantic: &semantic
+  id: semantic
+  plugin: simple_temporal_semantics                               # kind `semantic_adapter`; host runtime, stop-gradient
+  config: {window: 8, channels: 2, use_neural: true}              # -> 5 features: slopes(2), volatilities(2), neural cue(1)
+  inputs: {raw: observation://target_history, neural: module://upper/hidden}
+
+x-program: &program
+  id: slope_program
+  plugin: typed_program                                           # a ness.program/1 IR run by the reference interpreter
+  config:
+    output_dim: 2
+    port_bindings: {series: {port: series, dim: 2}}
+    constants: {window: 8}
+    program:
+      schema_version: ness.program/1
+      name: window_slope_8
+      semantics: typed_numeric_v1
+      example_status: illustrative_proposed
+      inputs: {series: numeric_series, window: int}
+      output: numeric_vector
+      body: {op: call, primitive: window_slope, args: {series: {op: input, name: series}, window: {op: input, name: window}}}
+  inputs: {series: observation://target_history}
+
+x-regime: &regime
+  id: regime
+  plugin: exact_finite_regime_reasoner                            # kind `reasoner`: exact enumeration over 2 latent states
+  config:
+    feature_ports: {semantic: 5, program: 2}
+    model:
+      latent_name: regime
+      states: [calm, volatile]
+      prior: [0.5, 0.5]
+      emission:
+        family: gaussian_diag                                     # fit these on your TRAIN split (see fit_regime_emissions.py)
+        means:  [[0.0, 0.0, 0.15, 0.10, 0.0, 0.0, 0.0], [0.0, 0.0, 0.45, 0.25, 0.0, 0.0, 0.0]]
+        scales: [[0.3, 0.3, 0.10, 0.08, 1.0, 0.3, 0.3], [0.3, 0.3, 0.20, 0.15, 1.0, 0.3, 0.3]]
+  inputs: {semantic: semantic://semantic/features, program: program://slope_program/value}
+
+x-learning: &learning {rule: bp_direct, optimizer: {kind: adam, lr: 0.003, clip_norm: 5.0}}
+
+arms:
+  native_baseline:
+    seed: 0
+    composition: {nodes: [*base], output: {task: future_value, from: substrate://base_ts/forecast/point}}
+
+  neural_cap:
+    seed: 0
+    learning: *learning
+    composition:
+      nodes:
+        - *base
+        - *upper
+        - {id: cap, plugin: residual_point_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16}},
+           inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden}}
+      output: {task: future_value, from: module://cap/forecast}
+
+  neuro_symbolic_probabilistic:
+    seed: 0
+    learning: *learning
+    composition:
+      nodes: [*base, *upper, *semantic, *program, *regime,
+              {id: cap, plugin: residual_point_cap,
+               config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 5, program: 2, posterior: 2}},
+               inputs: {baseline: substrate://base_ts/forecast/point, neural: module://upper/hidden,
+                        semantic: semantic://semantic/features, program: program://slope_program/value,
+                        posterior: reasoner://regime/posterior}}]
+      output: {task: future_value, from: module://cap/forecast}

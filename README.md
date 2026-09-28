@@ -18,7 +18,9 @@ coding-agent handoff addendum. Those two documents are not distributed in this r
 in the documentation point to them. Everything needed to *use* and *extend* the platform is
 in `docs/`.
 
-* **Read first:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (summary, layout, interfaces, how-to).
+* **Quick start (configure and run your first experiments):** [`docs/QUICKSTART.md`](docs/QUICKSTART.md)
+  with runnable examples in [`examples/quickstart/`](examples/quickstart/).
+* **Read first for the design:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (summary, layout, interfaces, how-to).
 * **Implementing your own NESS instance with your own models:** [`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md).
 * **Writing a plugin:** [`docs/CONTRIBUTING_PLUGINS.md`](docs/CONTRIBUTING_PLUGINS.md), then
   [`docs/COMPOSITION_GRAPH.md`](docs/COMPOSITION_GRAPH.md),

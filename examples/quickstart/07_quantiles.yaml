@@ -1,0 +1,37 @@
+# Quick start 07: a different prediction space. The substrate exposes native quantiles, the task
+# scores quantiles (pinball loss), and the cap corrects them monotonically.
+schema_version: ness.experiment/3
+protocol_id: quickstart_07_quantiles
+
+scenario:
+  plugin: toy_temporal_dataset
+  config: {n_steps: 400, context: 32, horizon: 4, seed: 1234, train_fraction: 0.7}
+
+tasks:
+  - id: future_quantiles
+    plugin: quantile_forecast_task
+    config: {horizons: 4, channels: [y0, y1], levels: [0.1, 0.5, 0.9]}
+
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 8, max_test_requests: 48}
+
+x-base: &base
+  id: base_ts
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7, pretrain_steps: 200, quantile_levels: [0.1, 0.5, 0.9]}
+  inputs: {history: observation://target_history}
+
+arms:
+  native_quantiles:
+    seed: 0
+    composition: {nodes: [*base], output: {task: future_quantiles, from: substrate://base_ts/forecast/quantiles}}
+
+  quantile_cap:
+    seed: 0
+    learning: {rule: bp_direct, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - *base
+        - {id: upper, plugin: tiny_upper_mlp, config: {in_dim: 16, model_dim: 16, hidden_dim: 32}, inputs: {main: substrate://base_ts/state/final}}
+        - {id: cap, plugin: residual_quantile_cap, config: {channels: [y0, y1], horizons: 4, levels: [0.1, 0.5, 0.9], features: {neural: 16}},
+           inputs: {baseline: substrate://base_ts/forecast/quantiles, neural: module://upper/hidden}}
+      output: {task: future_quantiles, from: module://cap/forecast}

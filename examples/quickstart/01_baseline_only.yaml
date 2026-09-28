@@ -1,0 +1,27 @@
+# Quick start 01: the frozen provider's own forecast. Nothing is learned; this is the control
+# every other arm is paired against.
+schema_version: ness.experiment/3
+protocol_id: quickstart_01_baseline
+
+scenario:
+  plugin: toy_temporal_dataset                                   # swap for your own ScenarioProvider plugin
+  config: {n_steps: 400, context: 32, horizon: 4, seed: 1234, train_fraction: 0.7}
+
+tasks:
+  - id: future_value
+    plugin: point_forecast_task
+    config: {horizons: 4, channels: [y0, y1], functional: mean, loss: mse}
+
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 4, max_test_requests: 48}
+
+arms:
+  native_baseline:
+    description: frozen provider's native point forecast
+    seed: 0
+    composition:
+      nodes:
+        - id: base_ts
+          plugin: toy_frozen_transformer                         # any plugin of kind `substrate`
+          config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7, pretrain_steps: 200}
+          inputs: {history: observation://target_history}       # observation fields come from the scenario
+      output: {task: future_value, from: substrate://base_ts/forecast/point}

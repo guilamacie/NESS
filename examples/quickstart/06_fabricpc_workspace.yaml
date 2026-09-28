@@ -1,0 +1,61 @@
+# Quick start 06: the same cap on the FabricPC backend (pip install "ness[fabricpc]"). Inference
+# (how the workspace settles) and learning (how weights change) are separate declarations.
+schema_version: ness.experiment/3
+protocol_id: quickstart_06_fabricpc
+
+runtime: {backend: auto, platform: auto, devices: {platform: any, selection: all}, x64: true, profile: development}
+
+scenario:
+  plugin: toy_temporal_dataset
+  config: {n_steps: 400, context: 32, horizon: 4, seed: 1234, train_fraction: 0.7}
+
+tasks:
+  - {id: future_value, plugin: point_forecast_task, config: {horizons: 4, channels: [y0, y1]}}
+
+protocol: {train_split: train, test_split: test, batch_size: 8, updates: 6, max_test_requests: 32}
+
+x-base: &base
+  id: base_ts
+  plugin: toy_frozen_transformer
+  config: {width: 16, heads: 2, layers: 2, channels: [y0, y1], horizons: 4, seed: 7, pretrain_steps: 200}
+  inputs: {history: observation://target_history}
+
+x-semantic: &semantic
+  id: semantic
+  plugin: simple_temporal_semantics
+  config: {window: 8, channels: 2, use_neural: false}             # 4 features
+  inputs: {raw: observation://target_history}
+
+# No learned transform may feed a FabricPC node (gradients do not cross runtimes): the substrate
+# state enters through a declared, parameter-free boundary reduction.
+x-cap-inputs: &cap_inputs
+  baseline: substrate://base_ts/forecast/point
+  neural: {from: substrate://base_ts/state/final, boundary: [mean_pool]}
+  semantic: semantic://semantic/features
+
+arms:
+  native_baseline:
+    seed: 0
+    composition: {nodes: [*base], output: {task: future_value, from: substrate://base_ts/forecast/point}}
+
+  fabricpc_feedforward_bp:                                        # FabricPC graph, no settling, BP of the task loss
+    seed: 0
+    inference: {profile: fabricpc_feedforward}
+    learning: {rule: fabricpc_bp_through_inference, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - *base
+        - *semantic
+        - {id: cap, plugin: fabricpc_residual_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 4}, hidden: [16], inference: {profile: fabricpc_feedforward}}, inputs: *cap_inputs}
+      output: {task: future_value, from: module://cap/forecast}
+
+  fabricpc_spc_pc_local:                                          # sPC free inference at prediction; clamped local PC rule for learning
+    seed: 0
+    inference: {profile: fabricpc_spc}
+    learning: {rule: fabricpc_pc_local, optimizer: {kind: adam, lr: 0.003}}
+    composition:
+      nodes:
+        - *base
+        - *semantic
+        - {id: cap, plugin: fabricpc_residual_cap, config: {channels: [y0, y1], horizons: 4, features: {neural: 16, semantic: 4}, hidden: [16], inference: {profile: fabricpc_spc, eta_infer: 0.05, infer_steps: 20}}, inputs: *cap_inputs}
+      output: {task: future_value, from: module://cap/forecast}
