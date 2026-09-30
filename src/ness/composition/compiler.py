@@ -97,6 +97,7 @@ class CompiledNode:
     descriptor: ModuleDescriptor
     inputs: dict[str, ResolvedInput]
     differentiable: bool  # runs in the differentiable runtime
+    training_only: bool = False  # executes only to supply learning targets (never during prediction)
 
 
 @dataclass
@@ -110,6 +111,7 @@ class CompiledGraph:
     stop_edges: tuple[str, ...]
     composition_hash: str
     warnings: tuple[str, ...] = ()
+    training_only_nodes: tuple[str, ...] = ()
 
     def node(self, node_id: str) -> CompiledNode:
         for n in self.nodes:
@@ -226,7 +228,7 @@ def compile_graph(
                     raise CompositionError(f"node {n.node_id} reads unknown node {s.selector.node_id!r}")
     order = _toposort(spec, producers)
 
-    diff_runtimes = {descriptors[n].runtime for n in order if descriptors[n].runtime in DIFFERENTIABLE_RUNTIMES}
+    diff_runtimes = {descriptors[n].runtime for n in order if descriptors[n].runtime in DIFFERENTIABLE_RUNTIMES and not node_specs[n].training_only}
     if len(diff_runtimes) > 1:
         raise CompositionError(f"multiple differentiable runtimes in one graph are not supported: {sorted(diff_runtimes)}")
     diff_runtime = next(iter(diff_runtimes)) if diff_runtimes else None
@@ -253,7 +255,7 @@ def compile_graph(
 
     for nid in order:
         nspec, desc = node_specs[nid], descriptors[nid]
-        dest_diff = desc.runtime == diff_runtime and diff_runtime is not None
+        dest_diff = desc.runtime == diff_runtime and diff_runtime is not None and not nspec.training_only
         resolved_inputs: dict[str, ResolvedInput] = {}
         wired = {w.port for w in nspec.inputs}
         for p in desc.input_ports:
@@ -298,6 +300,7 @@ def compile_graph(
                 src_diff = (
                     dest_diff
                     and sref.selector.node_id != OBSERVATION_NODE
+                    and not node_specs[sref.selector.node_id].training_only
                     and descriptors[sref.selector.node_id].runtime == diff_runtime
                     and pport.differentiability == Differentiability.DIFFERENTIABLE
                 )
@@ -341,7 +344,7 @@ def compile_graph(
                 raise CompositionError(
                     f"node {nid} input {w.port}: declared kind {dport.schema.kind!r} cannot receive a merged/transformed dense value")
             resolved_inputs[w.port] = ResolvedInput(dport, tuple(sources), w.merge, dict(w.merge_params), merge_group, w.post, tuple(post_groups), out_shape)
-        compiled[nid] = CompiledNode(nspec, modules[nid], desc, resolved_inputs, dest_diff)
+        compiled[nid] = CompiledNode(nspec, modules[nid], desc, resolved_inputs, dest_diff, nspec.training_only)
 
     # 4. outputs
     outputs: dict[str, ResolvedSource] = {}
@@ -361,6 +364,27 @@ def compile_graph(
             raise AccessPolicyViolation(f"output {o.source} has forbidden role {pport.availability_role.value}")
         outputs[o.task_id] = ResolvedSource(SourceRef(o.source), o.source.node_id, pport, pplugin, pversion, (), tuple(pport.schema.shape), pport.semantic_type, pport.coordinate_schema_id, False)
 
+    # 5. training-only nodes (ADR-0012): frozen, never on a path to a task output
+    training_only = tuple(n for n in order if node_specs[n].training_only)
+    for nid in training_only:
+        desc = descriptors[nid]
+        if desc.trainable_groups():
+            raise CompositionError(f"training-only node {nid} has trainable parameter groups {[g.name for g in desc.trainable_groups()]}; "
+                                   "training-only nodes must be frozen (stop-gradient target providers)")
+        if desc.module_kind == "memory_query":
+            raise CompositionError(f"training-only node {nid} is a memory query; memory is read only through pinned prediction-time views")
+    for nid in order:
+        if node_specs[nid].training_only:
+            continue
+        for w in node_specs[nid].inputs:
+            for sref in w.sources:
+                if sref.selector.node_id in training_only:
+                    raise CompositionError(f"node {nid} reads training-only node {sref.selector.node_id!r}; only training-only nodes may consume "
+                                           "a training-only node, so it can never influence a prediction")
+    for o in spec.outputs:
+        if o.source.node_id in training_only:
+            raise CompositionError(f"output for task {o.task_id} reads training-only node {o.source.node_id!r}; training-only nodes never feed predictions")
+
     comp_hash = content_hash({
         "spec": spec.canonical(),
         "descriptors": {nid: descriptors[nid].canonical() for nid in order},
@@ -368,4 +392,4 @@ def compile_graph(
         "observation_fields": {k: [v.role.value, v.semantic_type, v.coordinates.schema_id, list(v.shape)] for k, v in sorted(observation_fields.items())},
     })
     return CompiledGraph(spec, tuple(compiled[n] for n in order), outputs, dict(observation_fields), edge_params,
-                         diff_runtime, tuple(stop_edges), comp_hash, tuple(warnings))
+                         diff_runtime, tuple(stop_edges), comp_hash, tuple(warnings), training_only)

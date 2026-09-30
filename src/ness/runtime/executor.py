@@ -75,6 +75,8 @@ class GraphExecutor:
         versions: dict[str, tuple[str, str]] = {}
 
         for cn in self.compiled.nodes:
+            if cn.training_only:
+                continue  # never executed for a prediction (ADR-0012)
             nid = cn.spec.node_id
             inputs = {port: self._assemble(cn, port, ri, values, edge_params, ctx) for port, ri in cn.inputs.items()}
             # merged/transformed inputs are derived values: record them (graph + port map)
@@ -113,6 +115,47 @@ class GraphExecutor:
                 raise ContractViolation(f"output for task {task_id} is not a Forecast (got {type(pv.payload).__name__})")
             outputs[task_id] = pv
         return ExecutionRecord(values, graph, outputs, diagnostics, self.compiled.resolved_wiring(), versions, used)
+
+    def run_training_only(self, ctx: RuntimeContext, record: ExecutionRecord, node_states: dict[str, ModuleState],
+                          edge_params: dict[str, dict[str, np.ndarray]], node_ids: set[str]) -> dict[tuple[str, str], PortValue]:
+        """Execute the requested training-only nodes (and the training-only nodes they read) on the
+        values a prediction recorded; returns their output port values. Never touches ``record``."""
+        needed = set(node_ids)
+        training_only = set(self.compiled.training_only_nodes)
+        changed = True
+        while changed:  # close over training-only producers
+            changed = False
+            for cn in self.compiled.nodes:
+                if cn.spec.node_id in needed:
+                    for ri in cn.inputs.values():
+                        for s in ri.sources:
+                            if s.producer_node in training_only and s.producer_node not in needed:
+                                needed.add(s.producer_node)
+                                changed = True
+        values: dict[tuple[str, str], PortValue] = dict(record.port_values)
+        out: dict[tuple[str, str], PortValue] = {}
+        for cn in self.compiled.nodes:
+            nid = cn.spec.node_id
+            if nid not in needed:
+                continue
+            if not cn.training_only:
+                raise ContractViolation(f"node {nid} is not training-only; its values come from the prediction record")
+            inputs = {port: self._assemble(cn, port, ri, values, edge_params, ctx) for port, ri in cn.inputs.items()}
+            ctx.node_id = nid
+            res = cn.module.forward(inputs, node_states[nid], ctx)
+            used = tuple(res.used_inputs if res.used_inputs is not None else tuple(inputs))
+            dep_ids = tuple(inputs[p].evidence_id for p in used)
+            roles = frozenset().union(*(inputs[p].provenance.roles for p in used)) if used else frozenset({FieldRole.DERIVED})
+            resolved = tuple((p, s.selector) for p, ri in cn.inputs.items() for s in ri.sources)
+            for pspec in cn.descriptor.output_ports:
+                if pspec.name not in res.ports:
+                    raise ContractViolation(f"training-only node {nid}: module did not produce declared output port {pspec.name!r}")
+                prov = Provenance(ProducerRef(nid, cn.descriptor.plugin_id, cn.descriptor.plugin_version, pspec.name), dep_ids,
+                                  roles | {FieldRole.DERIVED}, None, resolved, f"{cn.descriptor.module_kind} (training-only)")
+                pv = self._wrap_output(nid, pspec, res.ports[pspec.name], prov, ctx)
+                values[(nid, pspec.name)] = pv
+                out[(nid, pspec.name)] = pv
+        return out
 
     # ------------------------------------------------------------------ helpers
     def _assemble(self, cn: CompiledNode, port: str, ri: ResolvedInput, values: dict[tuple[str, str], PortValue],

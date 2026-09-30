@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.0 (2026-10-01)
+
+Closes the platform gaps filed by the GPT-2 language-model instance (MUST N-02, N-04, N-05, N-09;
+SHOULD N-03/N-08, N-07 in part; bugs B-1, B-2), generically for every instance.
+
+* **Learning objectives** (`learning.objectives`, ADR-0012): `task`, `port_target` (loss between a
+  differentiable port and a constant target: a training-only node's port or a revealed
+  auxiliary target) and `parameter_anchor`; `applies_to` request filters; loss registry
+  (`mse`, `kl_last_axis`, `cross_entropy`, entry point `ness.losses`); per-objective accounting.
+* **Training-only nodes** (`training_only: true`): frozen target providers the compiler proves
+  cannot reach a prediction; executed only for learning.
+* **Auxiliary targets**: `outcome_only` fields revealed to learning only; outcome-free requests
+  may join a learning batch.
+* **Optimizer parameter groups and schedules** (`optimizer.param_groups`, `optimizer.schedule`,
+  ADR-0013) with per-group logging; optimizer configuration is checked on restore.
+* **Numerics** (`runtime.numerics: {matmul_precision, deterministic}`, ADR-0014) applied by the
+  bootstrap, recorded in the runtime report and in manifest identity.
+* **Inference-only runtimes** (`jax_inference`, `fabricpc_inference`, ADR-0015): one backend rule
+  for `NessSystem.build` and the runner; `ensure_bootstrapped` honours the launcher request; a
+  node that hides its backend fails closed at prediction.
+* **Runner generic over forecast types** (ADR-0017): checks on `dense()`, score-based rows and
+  pairing for non-element-wise forecasts, optional task `row_metrics`, `protocol.retention:
+  outputs`, `protocol.artifacts.ground_truth`.
+* Fixes: categorical `sample` drew only the first row (B-1); dtype-aware categorical
+  normalisation tolerance; float masks in the active dtype (B-2); the core hash ignores hidden
+  directories such as `.ipynb_checkpoints` (ADR-0016).
+* Strict validation: unknown keys in `optimizer`, `runtime.numerics`, objectives and
+  `protocol.artifacts` are errors.
+* Compatibility: every existing configuration validates and runs unchanged; predictions,
+  training histories and checkpoints are bitwise identical to 0.2.1 by default. Manifest ids
+  change once because the NESS version is part of the dependency lock (as at every release);
+  nothing else in the manifest changes for configurations without the new options, in an
+  environment without numeric XLA/JAX variables.
+
 ## 0.2.1 (2026-09-28)
 
 * Core-source integrity: `ness.integrity` records a release baseline hash of the core package

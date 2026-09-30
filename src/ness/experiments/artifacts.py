@@ -77,7 +77,7 @@ class ArtifactWriter:
         return p
 
     # ------------------------------------------------------------------ dataset
-    def write_dataset(self, scenario: Any, tasks: tuple[Any, ...]) -> None:
+    def write_dataset(self, scenario: Any, tasks: tuple[Any, ...], ground_truth: bool = True) -> None:
         if hasattr(scenario, "ground_truth"):
             gt = scenario.ground_truth()
             keys = list(gt)
@@ -90,6 +90,8 @@ class ArtifactWriter:
         self.json("data/splits.json", {s: list(scenario.origins(s)) for s in scenario.splits()} if hasattr(scenario, "origins") else {})
         self.json("data/observation_fields.json", {n: {"role": f.role.value, "semantic_type": f.semantic_type, "shape": list(f.shape), "coordinates": f.coordinates.schema_id}
                                                    for n, f in scenario.observation_fields().items()})
+        if not ground_truth:   # protocol.artifacts.ground_truth: false (large outcomes, e.g. long token streams)
+            return
         rows = []
         for split in scenario.splits():
             for req in scenario.iter_requests(split, tasks):
@@ -105,16 +107,33 @@ class ArtifactWriter:
 
     # ------------------------------------------------------------------ per-request traces
     @staticmethod
-    def prediction_row(arm: str, seed: int, phase: str, req: Any, outputs: dict[str, Any], outcomes: dict[str, Any], scores: dict[str, Any]) -> dict[str, Any]:
+    def prediction_row(arm: str, seed: int, phase: str, req: Any, outputs: dict[str, Any], outcomes: dict[str, Any], scores: dict[str, Any],
+                       tasks: dict[str, Any] | None = None) -> dict[str, Any]:
+        """One row per request. Element-wise ``pred_i/truth_i/abs_err_i`` columns and MAE/MSE are
+        written when the forecast has a point of the outcome's size (point and quantile tasks, as
+        in v0.2); otherwise (e.g. logits over classes against integer ids) the row carries the
+        score value and the task's optional ``row_metrics(forecast, outcome)`` scalars (ADR-0017)."""
         row: dict[str, Any] = {"arm": arm, "seed": seed, "phase": phase, "request_id": req.request_id, "origin": req.origin, **{f"g_{k}": v for k, v in req.group.items()}}
         for q in req.queries:
             fc = outputs.get(q.query_id)
             if fc is None:
                 continue
+            oc = outcomes.get(q.task_id)
+            if not ArtifactWriter._elementwise(fc, oc):
+                row[f"{q.task_id}/forecast_type"] = fc.forecast_type
+                task = (tasks or {}).get(q.task_id)
+                if oc is not None and task is not None and callable(getattr(task, "row_metrics", None)):
+                    for k, v in task.row_metrics(fc, oc).items():
+                        row[f"{q.task_id}/{k}"] = float(v)
+                sc = scores.get(q.task_id)
+                if sc is not None:
+                    row[f"{q.task_id}/score_num"] = sc.numerator
+                    row[f"{q.task_id}/score_den"] = sc.denominator
+                    row[f"{q.task_id}/score"] = sc.value
+                continue
             pred = np.asarray(fc.point()).reshape(-1)
             for i, v in enumerate(pred):
                 row[f"{q.task_id}/pred_{i}"] = float(v)
-            oc = outcomes.get(q.task_id)
             if oc is not None:
                 y = np.asarray(oc.values).reshape(-1)
                 m = np.asarray(oc.mask).reshape(-1)
@@ -128,6 +147,14 @@ class ArtifactWriter:
                 row[f"{q.task_id}/score_num"] = sc.numerator
                 row[f"{q.task_id}/score_den"] = sc.denominator
         return row
+
+    @staticmethod
+    def _elementwise(fc: Any, oc: Any) -> bool:
+        if not getattr(fc.capabilities, "point", False):
+            return False
+        if oc is None:
+            return True
+        return int(np.asarray(fc.point()).size) == int(np.asarray(oc.values).size)
 
     @staticmethod
     def evidence_rows(arm: str, seed: int, phase: str, req: Any, execution: Any) -> list[dict[str, Any]]:

@@ -23,6 +23,7 @@ from .executor import ExecutionRecord
 from .system import NessSystem
 
 MODES = ("frozen", "prequential")
+RETENTION = ("full", "outputs")  # what a transaction keeps per request after the outcome is revealed
 
 
 @dataclass
@@ -31,14 +32,22 @@ class PendingItem:
     execution: ExecutionRecord
     request: PredictionRequest
     outcomes: dict[str, TrainingOutcome] = field(default_factory=dict)  # task_id -> outcome
+    auxiliary: dict[str, np.ndarray] = field(default_factory=dict)        # revealed auxiliary targets (learning only)
 
 
 class PredictionTransaction:
-    def __init__(self, system: NessSystem, mode: str = "frozen") -> None:
+    def __init__(self, system: NessSystem, mode: str = "frozen", retention: str = "full") -> None:
+        """``retention``: ``full`` (default, v0.2) keeps every execution record until learning
+        consumes it (in ``frozen`` mode: forever); ``outputs`` drops a frozen prediction's execution
+        record (all port values) as soon as its outcome is revealed, keeping the immutable
+        prediction record and scores, so frozen evaluation memory stays flat in the stream length."""
         if mode not in MODES:
             raise UnsupportedCapability(f"evaluation mode {mode!r} is not implemented; modes {MODES}")
+        if retention not in RETENTION:
+            raise UnsupportedCapability(f"retention {retention!r} is not implemented; policies {RETENTION}")
         self.system = system
         self.mode = mode
+        self.retention = retention
         self.records: dict[str, PredictionRecord] = {}
         self.events: dict[str, ExperienceEvent] = {}
         self._pending: dict[str, PendingItem] = {}
@@ -73,7 +82,7 @@ class PredictionTransaction:
         if request_id not in self.records:
             raise ContractViolation(f"outcome for {request_id} arrived before any prediction was recorded")
         rec = self.records[request_id]
-        release = max(o.release_sequence for o in outcomes.values())
+        release = max((o.release_sequence for o in outcomes.values()), default=0)  # outcome-free items (e.g. a preservation stream) are allowed
         eid = ExperienceEvent.make_id(request_id, release)
         if eid in self.events:
             return self.events[eid]
@@ -86,9 +95,16 @@ class PredictionTransaction:
         item = self._pending.get(request_id)
         if item is not None and self.mode == "prequential":
             item.outcomes.update(outcomes)
+            # auxiliary targets: outcome_only fields that declared objectives read. They were never in any
+            # permitted view; they reach learning only here, after reveal (ADR-0012).
+            for name in self.system.auxiliary_fields():
+                if item.request.bundle.has(name):
+                    item.auxiliary[name] = np.array(item.request.bundle.field(name).array, copy=True)
             self._batch.append(item)
-            if self.system.memory is not None and self.system.memory.learner_appends:
+            if self.system.memory is not None and self.system.memory.learner_appends and item.outcomes:
                 self._memory_pending.append(self._episode_record(item))
+        elif item is not None and self.retention == "outputs":
+            self._pending.pop(request_id, None)
         return ev
 
     def _episode_record(self, item: PendingItem) -> MemoryRecord:
@@ -114,7 +130,7 @@ class PredictionTransaction:
         diag = None
         if self.system.trainable:
             from ..learning import BatchItem
-            batch = [BatchItem(it.execution, it.outcomes) for it in self._batch]
+            batch = [BatchItem(it.execution, it.outcomes, it.request, dict(it.auxiliary)) for it in self._batch]
             diag = self.system.learn(batch)
             for it in self._batch:
                 ev_ids = [e for e, ev in self.events.items() if ev.request_id == it.request.request_id]

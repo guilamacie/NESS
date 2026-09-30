@@ -157,6 +157,7 @@ runtime:                                     # optional
   devices: {platform: any, selection: all, fallback: error}   # optional device policy; fallback: cpu lets a gpu request degrade
   x64: true
   profile: development                       # development | scientific (scientific fails closed on unverified backend versions)
+  numerics: {matmul_precision: highest, deterministic: true}   # optional (0.3): recorded in reports and manifests
 
 scenario:                                    # required: the data
   plugin: toy_temporal_dataset
@@ -176,6 +177,8 @@ protocol:                                    # required
   max_train_requests: null                   # optional caps
   max_test_requests: 48
   restore_check_requests: 8                  # test requests re-predicted after checkpoint restore (must match exactly)
+  retention: full                            # full | outputs (0.3: outputs keeps frozen evaluation memory flat)
+  artifacts: {ground_truth: true}            # 0.3: false skips the ground-truth dump (large outcomes)
   causal_check: true                         # perturb withheld outcomes and re-predict
 
 arms:                                        # required: at least one
@@ -203,6 +206,16 @@ Usually omitted. `backend: auto` picks the least capable backend the selected ar
 Pin it when you want to *refuse* silently running on the wrong backend. `platform: gpu`
 fails closed if no GPU is visible unless `devices.fallback: cpu`. One process bootstraps one
 backend; FabricPC and plain JAX arms can share one `ness run` because FabricPC implies JAX.
+
+`numerics` (0.3) fixes the numerical environment that affects results and records it:
+`matmul_precision: default | high | highest` sets JAX's matrix-product precision (on GPUs the
+default is TensorFloat-32-class, relative error ~3e-4; `highest` is full float32), and
+`deterministic: true` adds `--xla_gpu_deterministic_ops=true --xla_gpu_autotune_level=0` to
+`XLA_FLAGS` so GPU results are bitwise reproducible across processes. Both are applied before the
+first JAX computation; a conflicting `XLA_FLAGS` or `JAX_DEFAULT_MATMUL_PRECISION` in your
+environment is an error, not a silent override. Declared numerics (and numeric variables your
+environment sets) are part of the manifest identity, so two systems that can predict differently
+never share a manifest id.
 
 ### `scenario`
 
@@ -234,6 +247,10 @@ split. After training, a learner checkpoint is published and restored, the first
 `restore_check_requests` test requests are re-predicted by the restored system (the difference
 must be exactly zero), and a causal check re-predicts one request with its withheld outcomes
 perturbed and removed. `seeds` runs every arm once per model seed with the dataset seed locked.
+Requests without any task outcome (for example a separate preservation stream used only by an
+auxiliary objective) are allowed: they are revealed with no outcomes and join the learning batch.
+`retention: outputs` drops each test prediction's execution record once scored (test-phase
+evidence traces are then not written); `artifacts.ground_truth: false` skips `data/ground_truth.csv`.
 
 ### `arms`: `learning`, `inference`, `memory`
 
@@ -241,7 +258,9 @@ perturbed and removed. `seeds` runs every arm once per model seed with the datas
   the deployed computation; jax runtime; alias `ff_bp`), `fabricpc_pc_local` (clamped settle +
   local PC weight gradients; aliases `workspace_pc_local`, `workspace_epc_local`),
   `fabricpc_bp_through_inference` (BP of the task loss through the FabricPC inference; alias
-  `workspace_bp_unroll`). `optimizer.kind` is `adam` or `sgd`, with `lr` and `clip_norm`.
+  `workspace_bp_unroll`). `optimizer.kind` is `adam` or `sgd`, with `lr`, `weight_decay`
+  (decoupled) and `clip_norm` (global), plus, from 0.3, `param_groups` and `schedule` (below).
+* `learning.objectives` (0.3): what an update minimises beyond the task losses (below).
 * `inference.profile`: `direct` (default; feedforward), `fabricpc_feedforward`, `fabricpc_spc`
   (sPC settling), `fabricpc_epc`; `fabricpc_spc_recurrent` is experimental and needs
   `allow_experimental: true`.
@@ -250,6 +269,67 @@ perturbed and removed. `seeds` runs every arm once per model seed with the datas
 The learning rule owns the trainable parameter groups of nodes in *its* runtime (and the learned
 boundary/merge parameters feeding them). A frozen arm has no `learning:`; an arm with a
 trainable node and no rule is rejected.
+
+#### Parameter groups and schedules (0.3)
+
+```yaml
+learning:
+  rule: bp_direct
+  optimizer:
+    kind: adam
+    lr: 0.001
+    clip_norm: 1.0                                   # global, over all groups
+    schedule: {kind: cosine, warmup_steps: 100, total_steps: 2000, min_lr_ratio: 0.1}   # constant | linear | cosine
+    param_groups:                                    # first match wins; each pattern must match an owned group
+      - {match: "student/*", lr_scale: 0.1, weight_decay: 0.01}
+      - {match: "cap/*", lr: 0.003, grad_multiplier: 1.0, clip_norm: 5.0}
+```
+
+Group ids are `node/group` (e.g. `upper/transformer`, `cap/consumer`) or learned-edge ids, as
+`ness validate` and the manifest's credit map show. Per update: `grad_multiplier`, then the
+group's `clip_norm`, then the global `clip_norm`, then decoupled weight decay
+`p * (1 - lr * wd)`, then the step, with `lr = (group lr or lr * lr_scale) * schedule(step)`.
+The effective learning rate, gradient norms and update norm of every group are logged to
+`metrics/train_history.csv` (`opt/<group>/...`), and the rules go into the manifest.
+
+#### Objectives, training-only nodes, auxiliary targets, anchors (0.3)
+
+```yaml
+learning:
+  rule: bp_direct
+  optimizer: {kind: adam, lr: 0.001}
+  objectives:
+    - {id: preserve, kind: port_target, weight: 0.5,
+       source: module://student/logits,              # a differentiable port (any node the rule trains)
+       target: substrate://teacher/logits,           # a constant: a training-only (or other frozen) node's port
+       loss: kl_last_axis, loss_config: {source: logits, target_space: logits},
+       applies_to: {group: {stream: preservation}}}  # only items whose request.group.stream matches
+    - {id: relations, kind: port_target, weight: 1.0,
+       source: semantic://rel/features, target: {auxiliary: relation_labels},   # an outcome_only field, revealed to learning only
+       loss: cross_entropy, mask: {auxiliary: relation_mask}}
+    - {id: keep, kind: parameter_anchor, groups: ["student/*"], weight: 0.001}  # 0.5*w*||theta - theta_initial||^2
+composition:
+  nodes:
+    - {id: teacher, plugin: my_teacher, training_only: true, inputs: {...}}    # never runs for a prediction
+```
+
+* With no `objectives`, the task losses are the objective, exactly as before. Declaring a
+  `kind: task` objective (`{id, kind: task, task: <task id>, weight, applies_to}`) replaces the
+  implicit per-task objectives.
+* Each objective is a sum of numerators over a sum of denominators over the items it applies
+  to, times its weight; items it does not apply to contribute nothing. Values, weights,
+  numerators, denominators and item counts are logged per update (`objective/<id>/...`).
+* Built-in losses: `mse`, `kl_last_axis` (KL(target || source) over the last axis, per
+  position), `cross_entropy` (integer ids). Your package can add more through the `ness.losses`
+  entry point.
+* A **training-only** node must be frozen, and only other training-only nodes may read it; the
+  compiler rejects any path from it to a task output. It runs only when an objective needs its
+  output, on the values the prediction recorded.
+* An **auxiliary target** is an `outcome_only` field your scenario declares and puts in the
+  bundle; it never reaches a prediction (the compiler refuses to wire it, the causal check
+  perturbs it) and `reveal` hands it to learning.
+* Objectives other than anchors are evaluated by `bp_direct` in per-item mode; anchors work
+  with every rule and their reference is kept in learner checkpoints.
 
 ## 6. Wiring nodes together: ports, selectors, boundaries, merges
 
@@ -540,7 +620,8 @@ itself. `src/ness/scenarios/toy_regime.py` is a complete small example including
 field predictors cannot read.
 
 **Your models** are plugins. A plugin class declares `plugin_id`, `plugin_version`,
-`module_kind`, `runtime` (`numpy`, `host`, `jax`, `fabricpc`), implements `validate_config`,
+`module_kind`, `runtime` (`numpy`, `host`, `jax`, `fabricpc`, or `jax_inference` for a frozen
+module that computes with JAX but is never differentiated), implements `validate_config`,
 `describe()` (ports, parameter groups, capabilities), `initialize(rng)` and
 `forward(inputs, state, ctx)`; trainable modules also implement
 `apply(params, dense_inputs, state, xp)` so the same code runs eagerly (numpy) and under
@@ -615,6 +696,11 @@ so a plot can always be traced to saved numbers.
 | `runtime already bootstrapped ... cannot re-initialise JAX` | two incompatible runtime requests in one process | run the FabricPC arm in a fresh process, or bootstrap it first |
 | `AccessPolicyViolation` | a wire reads a field the task view forbids (an outcome, an oracle, a namespace) | it is the design working; read only permitted fields |
 | `no plugin registered with id 'X'` | the plugin package is not installed, or its entry point is misspelt | `pip install` the package; check `ness plugins` |
+| `optimizer.param_groups patterns [...] match no owned parameter group` | a group pattern matches nothing trainable | check group ids with `ness validate` / the manifest credit map |
+| `objective X: source ... is not differentiable` | the objective's source is a frozen or host port | point `source` at a port of a trainable jax node |
+| `reads training-only node` | a predicting node or task output reads a training-only node | only training-only nodes and objectives may read it |
+| `a node needed the 'jax' backend on demand` | a plugin computes with JAX but declares runtime `numpy` | declare `runtime = "jax_inference"` (or set `runtime.backend: jax`) |
+| `runtime.numerics ... conflicts with` | your environment already sets a different XLA flag or matmul precision | remove one of the two |
 
 ## 15. Where next
 

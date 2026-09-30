@@ -46,6 +46,12 @@ def _split_gid(gid: str) -> tuple[str, str] | None:
     return node, group
 
 
+def _float_dtype():
+    """The active floating dtype (float64 under x64, float32 otherwise): masks are built in it
+    so no float64 request is made when x64 is off (bug B-2: a JAX dtype warning per update)."""
+    return jax.dtypes.canonicalize_dtype(jnp.float64)
+
+
 def sharded_mesh(devices: Any = None):
     """A one-axis ``("data",)`` mesh over the selected (or all) devices."""
     devs = list(devices) if devices is not None else jax.devices()
@@ -135,12 +141,15 @@ class DifferentiableRegion:
 
     # ------------------------------------------------------------------ per-item objective
     def loss_and_grads(self, batch: list[BatchItem], node_states, edge_params, owned_groups: tuple[str, ...], tasks: dict[str, Any],
-                       task_weights: dict[str, float] | None = None):
+                       task_weights: dict[str, float] | None = None, objectives: Any = None):
         if not batch:
             raise ContractViolation("empty batch: declared protocol rejects no-op updates")
+        if objectives is not None and objectives.uses_region:
+            return self._loss_and_grads_objectives(batch, node_states, edge_params, owned_groups, tasks, objectives)
         weights = task_weights or {}
         train = self.collect_trainable(node_states, edge_params, owned_groups)
         consts_list = [self.constants(it.record) for it in batch]
+        fdt = _float_dtype()
 
         def objective(tp):
             nums = {t: 0.0 for t in self.compiled.outputs}
@@ -148,7 +157,7 @@ class DifferentiableRegion:
             for it, consts in zip(batch, consts_list):
                 computed = self._forward(consts, node_states, edge_params, tp)
                 ys = {t: jnp.asarray(o.values) for t, o in it.outcomes.items()}
-                ms = {t: jnp.asarray(o.mask, dtype=jnp.float64) for t, o in it.outcomes.items()}
+                ms = {t: jnp.asarray(o.mask, dtype=fdt) for t, o in it.outcomes.items()}
                 for t, (n, d) in self._task_terms(computed, consts, ys, ms, tasks, weights).items():
                     nums[t] = nums[t] + n
                     dens[t] = dens[t] + d
@@ -156,6 +165,63 @@ class DifferentiableRegion:
 
         loss, grads = jax.value_and_grad(objective)(train)
         return self._finish(loss, grads, {"mode": "per_item", "batch_size": len(batch), "owned_groups": list(owned_groups)})
+
+    def _loss_and_grads_objectives(self, batch: list[BatchItem], node_states, edge_params, owned_groups: tuple[str, ...], tasks: dict[str, Any], plan: Any):
+        """Declared objectives (ADR-0012). Task objectives reproduce the default reduction exactly
+        (same accumulation order and expression); ``port_target`` objectives follow. An objective
+        with weight 0 is evaluated for logging only and does not enter the differentiated sum, so
+        adding it leaves gradients bitwise unchanged. Items an objective does not apply to
+        contribute zero to its numerator and denominator."""
+        train = self.collect_trainable(node_states, edge_params, owned_groups)
+        consts_list = [self.constants(it.record) for it in batch]
+        fdt = _float_dtype()
+        counts = {o.objective_id: 0 for o in (*plan.task_objectives, *plan.port_objectives)}
+        for it in batch:
+            for o in (*plan.task_objectives, *plan.port_objectives):
+                if o.objective_id in it.active_objectives:
+                    counts[o.objective_id] += 1
+
+        def objective(tp):
+            tnum = {o.objective_id: 0.0 for o in plan.task_objectives}
+            tden = {o.objective_id: 0.0 for o in plan.task_objectives}
+            pnum = {o.objective_id: 0.0 for o in plan.port_objectives}
+            pden = {o.objective_id: 0.0 for o in plan.port_objectives}
+            for it, consts in zip(batch, consts_list):
+                computed = self._forward(consts, node_states, edge_params, tp)
+                for o in plan.task_objectives:
+                    if o.objective_id not in it.active_objectives:
+                        continue
+                    t = o.task_id
+                    src = self.compiled.outputs[t]
+                    key = (src.producer_node, src.producer_port.name)
+                    pred = computed[key] if key in computed else jnp.asarray(consts[key])
+                    oc = it.outcomes[t]
+                    n, d = tasks[t].loss_terms(pred, jnp.asarray(oc.values), jnp.asarray(oc.mask, dtype=fdt), jnp)
+                    tnum[o.objective_id] = tnum[o.objective_id] + n
+                    tden[o.objective_id] = tden[o.objective_id] + d
+                for o in plan.port_objectives:
+                    if o.objective_id not in it.active_objectives:
+                        continue
+                    key = plan.source_keys[o.objective_id]
+                    pred = computed[key] if key in computed else jnp.asarray(consts[key])
+                    target, mask = it.objective_inputs[o.objective_id]
+                    n, d = plan.losses[o.loss].fn(pred, jnp.asarray(target), None if mask is None else jnp.asarray(mask, dtype=fdt), jnp, **o.loss_config)
+                    pnum[o.objective_id] = pnum[o.objective_id] + n
+                    pden[o.objective_id] = pden[o.objective_id] + d
+            total = sum(o.weight * tnum[o.objective_id] / jnp.maximum(tden[o.objective_id], 1e-12) for o in plan.task_objectives if o.weight != 0.0)
+            for o in plan.port_objectives:
+                if o.weight != 0.0:
+                    total = total + o.weight * pnum[o.objective_id] / jnp.maximum(pden[o.objective_id], 1e-12)
+            aux = {**{k: (tnum[k], tden[k]) for k in tnum}, **{k: (pnum[k], pden[k]) for k in pnum}}
+            return total, aux
+
+        (loss, aux), grads = jax.value_and_grad(objective, has_aux=True)(train)
+        weights = {o.objective_id: o.weight for o in (*plan.task_objectives, *plan.port_objectives)}
+        per_obj = {}
+        for oid, (n, d) in aux.items():
+            n, d = float(n), float(d)
+            per_obj[oid] = {"value": n / d if d > 0 else float("nan"), "weight": weights[oid], "numerator": n, "denominator": d, "items": counts[oid]}
+        return self._finish(loss, grads, {"mode": "per_item", "batch_size": len(batch), "owned_groups": list(owned_groups), "objectives": per_obj})
 
     # ------------------------------------------------------------------ batched / sharded objective
     def loss_and_grads_batched(self, batch: list[BatchItem], node_states, edge_params, owned_groups: tuple[str, ...], tasks: dict[str, Any],
@@ -174,7 +240,7 @@ class DifferentiableRegion:
         task_ids = [t for t in self.compiled.outputs if all(t in it.outcomes for it in batch)]
         stacked = {k: jnp.asarray(np.stack([c[k] for c in consts_list])) for k in self._const_keys}
         ys = {t: jnp.asarray(np.stack([it.outcomes[t].values for it in batch])) for t in task_ids}
-        ms = {t: jnp.asarray(np.stack([it.outcomes[t].mask.astype(np.float64) for it in batch])) for t in task_ids}
+        ms = {t: jnp.asarray(np.stack([it.outcomes[t].mask.astype(np.float64) for it in batch]), dtype=_float_dtype()) for t in task_ids}
         n_dev = 1
         if mesh is not None:
             n_dev = mesh.shape["data"]
@@ -255,6 +321,11 @@ class BPDirectRule:
         region = ctx.caches.get("jax_region")
         if region is None:
             region = ctx.caches["jax_region"] = DifferentiableRegion(ctx.compiled)
+        plan = getattr(ctx, "objectives", None)
+        if plan is not None and plan.uses_region:
+            if self.data_parallel or self.batched:
+                raise UnsupportedCapability("declared task/port_target objectives are verified in per-item evaluation only")
+            return region.loss_and_grads(batch, ctx.node_states, ctx.edge_params, owned_groups, ctx.tasks, self.task_weights, plan)
         if self.data_parallel:
             devices = None
             rep = ctx.runtime_report

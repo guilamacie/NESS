@@ -65,6 +65,7 @@ class NodeSpec:
     inputs: tuple[InputWiring, ...] = ()
     memory_queries: tuple[str, ...] = ()
     enabled: bool = True
+    training_only: bool = False   # executes only to supply learning targets; never in prediction (ADR-0012)
 
     def __post_init__(self) -> None:
         if not self.node_id or "/" in self.node_id or ":" in self.node_id:
@@ -74,8 +75,11 @@ class NodeSpec:
             raise CompositionError(f"node {self.node_id}: duplicate input wiring {names}")
 
     def canonical(self) -> dict:
-        return {"node_id": self.node_id, "plugin": self.plugin, "config": self.config, "inputs": [w.canonical() for w in self.inputs],
-                "memory_queries": list(self.memory_queries), "enabled": self.enabled}
+        out = {"node_id": self.node_id, "plugin": self.plugin, "config": self.config, "inputs": [w.canonical() for w in self.inputs],
+               "memory_queries": list(self.memory_queries), "enabled": self.enabled}
+        if self.training_only:  # absent unless set: composition hashes of v0.2 configurations are unchanged
+            out["training_only"] = True
+        return out
 
 
 @dataclass(frozen=True, slots=True)

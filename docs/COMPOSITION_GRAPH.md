@@ -52,3 +52,12 @@ meaningful macro modules read which earlier ports*. It is not a tensor IR.
 
 All are edits to `inputs`/`plugin` fields only. Examples are in
 `examples/vertical_slice_timeseries/configs/vertical_slice.yaml` and `tests/test_vertical_slice.py`.
+
+## Training-only nodes (0.3, ADR-0012)
+
+`training_only: true` on a node makes it a frozen provider of learning targets. The compiler
+requires it to have no trainable groups, allows only other training-only nodes to read it and
+forbids task outputs from reading it, so it can never influence a prediction. It is never
+executed for a prediction; objectives that need its output run it on the prediction record's
+values at learning time. It is listed in the manifest (`training_only_nodes`) and by
+`ness validate` / `ness graph`.

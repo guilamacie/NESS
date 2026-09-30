@@ -5,6 +5,7 @@ credit map and optimizer - with whole-system manifest, snapshot and restore."""
 from __future__ import annotations
 
 import copy
+import dataclasses
 import platform
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,12 +32,13 @@ from ..contracts import (
 from ..checkpoint import SystemSnapshot
 from ..experiments.spec import ArmSpec, ExperimentSpec, parse_arm, parse_experiment
 from ..inference import resolve_inference_profile
-from ..learning import CreditMap, LearningContext, Optimizer, build_credit_map, module_group_id, resolve_learning_profile
+from ..learning import FROZEN, CreditMap, LearningContext, Optimizer, build_credit_map, module_group_id, resolve_learning_profile
+from ..learning.objectives import ObjectivePlan, bind_objectives, parse_objectives
 from ..learning.profiles import ALIASES as LEARNING_ALIASES
 from ..memory import EMPTY_SNAPSHOT_ID, InMemorySnapshotStore, MemoryEvent, MemoryRecord
 from ..plugin_api.module import RuntimeContext
 from ..plugin_api.registry import PluginRegistry
-from ..runtimes.bootstrap import RuntimeReport, RuntimeRequest, bootstrap, current_report
+from ..runtimes.bootstrap import RuntimeReport, RuntimeRequest, backend_for_runtime, bootstrap, current_report, node_backend, numerics_identity
 from .executor import ExecutionRecord, GraphExecutor
 
 MANIFEST_SCHEMA = "ness.manifest/1"
@@ -60,12 +62,21 @@ BACKEND_RANK = {"numpy": 0, "host": 0, "jax": 1, "fabricpc": 2}
 
 
 def required_backend(runtimes: set[str]) -> str:
-    """The single backend that must be bootstrapped for a set of module runtimes."""
+    """The single backend that must be bootstrapped for a set of module runtimes (or backend
+    names). Inference-only runtimes (``jax_inference``) need their backend; unknown runtimes
+    (e.g. ``torch``) need none (ADR-0015)."""
     best = "numpy"
     for r in runtimes:
-        if BACKEND_RANK.get(r, 0) > BACKEND_RANK[best]:
-            best = r
+        b = backend_for_runtime(r)
+        if BACKEND_RANK[b] > BACKEND_RANK[best]:
+            best = b
     return best
+
+
+def compiled_backends(compiled: CompiledGraph) -> set[str]:
+    """The backends a compiled graph's nodes need, by the one rule both launch paths use:
+    the more capable of each node's runtime and its declared ``requires``."""
+    return {node_backend(cn.descriptor.runtime, cn.descriptor.requires) for cn in compiled.nodes}
 
 
 def runtime_request_for(exp: "ExperimentSpec", runtimes: set[str]) -> RuntimeRequest:
@@ -107,6 +118,8 @@ class NessSystem:
         self.executor = GraphExecutor(compiled)
         self._learning_caches: dict[str, Any] = {}
         self._manifest_cache: PredictorManifest | None = None
+        self.objectives: ObjectivePlan | None = None        # declared learning.objectives (None: v0.2 implicit task losses)
+        self.anchor_refs: dict[str, dict[str, dict[str, np.ndarray]]] | None = {}  # anchor id -> group -> name -> reference (None: unavailable)
 
     @property
     def rule(self) -> Any:
@@ -125,15 +138,34 @@ class NessSystem:
         compiled = compile_graph(arm.composition, registry, scenario.observation_fields(), spaces, roles)
         # ---- runtime bootstrap: the ONLY place a system initialises a numerical backend, and it
         # happens before any module state (arrays) is created.
-        runtimes = {cn.descriptor.runtime for cn in compiled.nodes}
-        report = bootstrap(runtime_request_for(exp, runtimes))
+        report = bootstrap(runtime_request_for(exp, compiled_backends(compiled)))
         rng = np.random.default_rng(arm.seed)
         node_states = {cn.spec.node_id: cn.module.initialize(rng) for cn in compiled.nodes}
         edge_params = compiled.init_edge_params(rng)
         inference_profile = resolve_inference_profile(arm.inference.get("profile", "direct"), bool(arm.inference.get("allow_experimental", False)))
         rules, credit, optimizer, learning_profile = cls._build_learning(exp, arm, registry, compiled)
+        plan, credit = cls._build_objectives(arm, compiled, scenario, tasks, credit, rules)
         memory = cls._attach_memory(arm, registry, scenario, exp)
-        return cls(exp, arm, registry, scenario, tasks, compiled, node_states, edge_params, rng, memory, inference_profile, learning_profile, credit, rules, optimizer, 0, report)
+        sys_ = cls(exp, arm, registry, scenario, tasks, compiled, node_states, edge_params, rng, memory, inference_profile, learning_profile, credit, rules, optimizer, 0, report)
+        sys_.objectives = plan
+        if plan is not None and plan.anchors:
+            sys_.set_anchor_reference()
+        return sys_
+
+    @staticmethod
+    def _build_objectives(arm: ArmSpec, compiled: CompiledGraph, scenario: Any, tasks: dict[str, Any], credit: CreditMap,
+                          rules: dict[str, Any]) -> tuple[ObjectivePlan | None, CreditMap]:
+        """Bind ``learning.objectives`` (ADR-0012); anchors are recorded in the credit map."""
+        specs = parse_objectives(arm.learning.get("objectives"))
+        if specs is None:
+            return None, credit
+        if not rules:
+            raise ValidationError(f"arm {arm.arm_id} declares learning.objectives but has no trainable parameters")
+        bp = rules.get("bp_direct")
+        plan = bind_objectives(specs, compiled, scenario.observation_fields(), tasks, credit.owners, rules, getattr(bp, "task_weights", None))
+        if plan.anchors:
+            credit = dataclasses.replace(credit, anchors=tuple((gid, f"l2_to_reference:{o.reference}:{o.objective_id}", o.weight) for o in plan.anchors for gid in o.groups))
+        return plan, credit
 
     @staticmethod
     def _build_learning(exp: ExperimentSpec, arm: ArmSpec, registry: PluginRegistry, compiled: CompiledGraph):
@@ -162,6 +194,7 @@ class NessSystem:
             if need is not None and need not in node_runtimes:
                 raise UnsupportedCapability(f"learning rule {rid} requires runtime {need!r}; the composition has runtimes {sorted(node_runtimes)}")
         optimizer = Optimizer.from_config(arm.learning.get("optimizer", {"kind": "adam", "lr": 1e-2}))
+        optimizer.bind_groups([g for g, r in credit.owners.items() if r != FROZEN])
         return rules, credit, optimizer, default_profile
 
     @staticmethod
@@ -215,7 +248,15 @@ class NessSystem:
         manifest_id = self.manifest().manifest_id
         ctx = RuntimeContext(request, permitted, policy, manifest_id, self.request_rng(request.request_id), ledger, views, mode, services=services)
         scen = self.scenario.describe()
+        before = current_report()
         record = self.executor.run(ctx, self.node_states, self.edge_params, (scen.plugin_id, scen.plugin_version))
+        if current_report() is not before and before is not None:
+            self._runtime_mismatch = current_report().backend
+        if getattr(self, "_runtime_mismatch", None):
+            raise ContractViolation(
+                f"arm {self.arm.arm_id}: a node needed the {self._runtime_mismatch!r} backend on demand although the system bootstrapped "
+                f"{(self.runtime_report.backend if self.runtime_report else 'numpy')!r}; its manifest would misstate the runtime. Declare the node's "
+                "runtime truthfully (e.g. 'jax_inference' for frozen JAX computation) or set runtime.backend explicitly")
         outputs, statuses = {}, {}
         for q in request.queries:
             pv = record.outputs[q.task_id]
@@ -247,7 +288,99 @@ class NessSystem:
 
     def learning_context(self) -> LearningContext:
         weights = {t.task_id: t.weight for t in self.exp.tasks}
-        return LearningContext(self.compiled, self.node_states, self.edge_params, self.tasks, weights, self.runtime_report, self._learning_caches)
+        return LearningContext(self.compiled, self.node_states, self.edge_params, self.tasks, weights, self.runtime_report, self._learning_caches,
+                               self.objectives)
+
+    # ------------------------------------------------------------------ objectives (ADR-0012)
+    def auxiliary_fields(self) -> frozenset[str]:
+        """Outcome-only observation fields that declared objectives read as revealed targets."""
+        return self.objectives.auxiliary_fields if self.objectives is not None else frozenset()
+
+    def set_anchor_reference(self, objective_id: str | None = None) -> None:
+        """Snapshot the current parameters of an anchor's groups as its reference (all anchors
+        when ``objective_id`` is None). Build does this once (``reference: initial``)."""
+        if self.objectives is None or not self.objectives.anchors:
+            raise ContractViolation("this arm declares no parameter_anchor objectives")
+        params = self.all_params()
+        refs = dict(self.anchor_refs or {})
+        for o in self.objectives.anchors:
+            if objective_id is None or o.objective_id == objective_id:
+                refs[o.objective_id] = {gid: {n: np.array(a, dtype=np.float64, copy=True) for n, a in params[gid].items()} for gid in o.groups}
+        if objective_id is not None and objective_id not in refs:
+            raise ContractViolation(f"unknown parameter_anchor objective {objective_id!r}")
+        self.anchor_refs = refs
+
+    def _run_training_only(self, item: Any, node_ids: set[str]) -> dict[tuple[str, str], Any]:
+        if item.request is None:
+            raise ContractViolation("training-only targets need the batch item's request (construct BatchItem with request=...)")
+        policies = self._policy_for(item.request)
+        policy = next(iter(policies.values()))
+        permitted = item.request.bundle.select(policy)
+        permitted.assert_prediction_safe()
+        rng = np.random.default_rng(int(content_hash({"seed": self.arm.seed, "request": item.request.request_id, "phase": "training_only"})[:16], 16))
+        ctx = RuntimeContext(item.request, permitted, policy, self.manifest().manifest_id, rng, CostLedger(), {}, "train")
+        return self.executor.run_training_only(ctx, item.record, self.node_states, self.edge_params, node_ids)
+
+    def _prepare_objectives(self, batch: list[Any]) -> None:
+        """Decide which objectives apply to each item and materialise their constant targets:
+        training-only nodes run here (never at prediction); auxiliary targets come from reveal."""
+        plan = self.objectives
+        assert plan is not None
+        for it in batch:
+            active: set[str] = set()
+            for o in plan.task_objectives:
+                if o.task_id in it.outcomes and o.applies_to.matches(it.request, it.outcomes):
+                    active.add(o.objective_id)
+            port = [o for o in plan.port_objectives if o.applies_to.matches(it.request, it.outcomes)]
+            to_nodes = {plan.target_keys[o.objective_id][0] for o in port if o.objective_id in plan.target_keys
+                        and self.compiled.node(plan.target_keys[o.objective_id][0]).training_only}
+            extra = self._run_training_only(it, to_nodes) if to_nodes else {}
+            inputs: dict[str, tuple[np.ndarray, np.ndarray | None]] = {}
+            rid = getattr(it.request, "request_id", "?")
+            for o in port:
+                if o.target_port is not None:
+                    key = plan.target_keys[o.objective_id]
+                    pv = extra[key] if key in extra else it.record.port_values.get(key)
+                    if pv is None:
+                        raise ContractViolation(f"objective {o.objective_id}: target {o.target_port} has no value for request {rid}")
+                    target = np.asarray(pv.dense())
+                else:
+                    if o.target_field not in it.auxiliary:
+                        raise ContractViolation(f"objective {o.objective_id}: auxiliary target {o.target_field!r} was not revealed for request {rid}")
+                    target = it.auxiliary[o.target_field]
+                mask = None
+                if o.mask_field is not None:
+                    if o.mask_field not in it.auxiliary:
+                        raise ContractViolation(f"objective {o.objective_id}: auxiliary mask {o.mask_field!r} was not revealed for request {rid}")
+                    mask = it.auxiliary[o.mask_field]
+                inputs[o.objective_id] = (target, mask)
+                active.add(o.objective_id)
+            it.active_objectives = frozenset(active)
+            it.objective_inputs = inputs
+
+    def _apply_anchors(self, grads: dict[str, dict[str, np.ndarray]]) -> tuple[float, dict[str, Any]]:
+        """``0.5 * w * ||theta - theta_ref||^2`` per anchor; gradient ``w * (theta - theta_ref)``."""
+        plan = self.objectives
+        if plan is None or not plan.anchors:
+            return 0.0, {}
+        if self.anchor_refs is None or any(o.objective_id not in self.anchor_refs for o in plan.anchors):
+            raise ContractViolation("parameter anchor references are unavailable (restored from a serving checkpoint?); restore a learner "
+                                    "checkpoint or call set_anchor_reference() explicitly")
+        params = self.all_params()
+        total, diag = 0.0, {}
+        for o in plan.anchors:
+            ref = self.anchor_refs[o.objective_id]
+            n = 0.0
+            for gid in o.groups:
+                for name, theta in params[gid].items():
+                    diff = np.asarray(theta, dtype=np.float64) - ref[gid][name]
+                    n += 0.5 * float(np.sum(diff ** 2))
+                    if o.weight != 0.0:
+                        grp = grads.setdefault(gid, {})
+                        grp[name] = (grp[name] + o.weight * diff) if name in grp else o.weight * diff
+            total += o.weight * n
+            diag[o.objective_id] = {"value": n, "weight": o.weight, "numerator": n, "denominator": 1.0, "items": 0}
+        return total, diag
 
     def all_params(self) -> dict[str, dict[str, np.ndarray]]:
         out = {module_group_id(nid, g): grp for nid, st in self.node_states.items() for g, grp in st.params.items()}
@@ -260,6 +393,8 @@ class NessSystem:
         if not self.trainable:
             raise UnsupportedCapability(f"arm {self.arm.arm_id} has no learning rule; learn() is not available")
         ctx = self.learning_context()
+        if self.objectives is not None:
+            self._prepare_objectives(batch)
         grads: dict[str, dict[str, np.ndarray]] = {}
         diag: dict[str, Any] = {"rules": {}}
         total_loss = 0.0
@@ -271,8 +406,19 @@ class NessSystem:
             grads.update(g)
             diag["rules"][rid] = {"loss": loss, **d}
             total_loss = total_loss if rid != self.learning_profile else loss
+        anchor_loss, anchor_diag = self._apply_anchors(grads)
+        if self.objectives is not None:
+            objs: dict[str, Any] = {}
+            for d in diag["rules"].values():
+                objs.update(d.pop("objectives", {}) or {})
+            objs.update(anchor_diag)
+            diag["objectives"] = objs
+            if self.learning_profile in diag["rules"]:
+                diag["rules"][self.learning_profile]["loss"] = diag["rules"][self.learning_profile]["loss"] + anchor_loss
         assert self.optimizer is not None
         updated = self.optimizer.update({g: self.all_params()[g] for g in grads}, grads)
+        if self.optimizer.configured:
+            diag["optimizer"] = {"step": self.optimizer.step, "groups": self.optimizer.last_stats}
         for gid, grp in updated.items():
             if "#" in gid:
                 self.edge_params[gid] = grp
@@ -310,7 +456,8 @@ class NessSystem:
             self.memory.snapshot_id if self.memory else None, self.inference_profile, self.learning_profile, self.credit.credit_hash,
             content_hash(self.rng.bit_generator.state), dependency_lock(), None,
             {"n_updates": self.n_updates, "resolved_wiring": self.compiled.resolved_wiring(), "runtime": self._runtime_extra(),
-             "algorithm_specs": self._algorithm_specs(), "learning_rules": sorted(self.rules)})
+             "algorithm_specs": self._algorithm_specs(), "learning_rules": sorted(self.rules),
+             **({"training_only_nodes": list(self.compiled.training_only_nodes)} if self.compiled.training_only_nodes else {})})
         return self._manifest_cache
 
     def _runtime_extra(self) -> dict[str, Any]:
@@ -322,9 +469,13 @@ class NessSystem:
         if rep is None:
             return {"backend": "numpy"}
         v = rep.versions
-        return {"backend": rep.backend, "x64": rep.request.x64, "platform": rep.devices.platform if rep.devices else "none",
-                "jax": v.get("jax", "absent"), "jaxlib": v.get("jaxlib", "absent"), "fabricpc": v.get("fabricpc", "absent"),
-                "fabricpc_adapter": __import__("ness.backends.fabricpc", fromlist=["ADAPTER_VERSION"]).ADAPTER_VERSION if rep.backend == "fabricpc" else None}
+        out = {"backend": rep.backend, "x64": rep.request.x64, "platform": rep.devices.platform if rep.devices else "none",
+               "jax": v.get("jax", "absent"), "jaxlib": v.get("jaxlib", "absent"), "fabricpc": v.get("fabricpc", "absent"),
+               "fabricpc_adapter": __import__("ness.backends.fabricpc", fromlist=["ADAPTER_VERSION"]).ADAPTER_VERSION if rep.backend == "fabricpc" else None}
+        num = numerics_identity(rep)
+        if num is not None:  # only when declared or set by the user's environment: v0.2 manifests unchanged otherwise
+            out["numerics"] = num
+        return out
 
     def runtime_diagnostics(self) -> dict[str, Any]:
         rep = self.runtime_report or current_report()
@@ -342,11 +493,20 @@ class NessSystem:
             spec = getattr(rule, "algorithm_spec", None)
             if callable(spec):
                 out[f"rule:{rid}"] = spec(self.compiled, self.owned_groups(rid))
+        if self.objectives is not None:   # present only when declared: v0.2 manifests unchanged
+            out["objectives"] = self.objectives.canonical()
+        if self.optimizer is not None and self.optimizer.configured:
+            out["optimizer"] = self.optimizer.spec()
         return out
 
     def snapshot(self, kind: str = "serving") -> SystemSnapshot:
         mem = self.memory.store.export_snapshot(self.memory.snapshot_id) if self.memory else None
         opt = self.optimizer.snapshot() if (kind == "learner" and self.optimizer is not None) else None
+        if opt is not None and self.anchor_refs:
+            arrays, data = dict(opt[0]), dict(opt[1])
+            arrays.update({f"a|{oid}|{gid}|{n}": a for oid, grps in self.anchor_refs.items() for gid, grp in grps.items() for n, a in grp.items()})
+            data["anchors"] = sorted(self.anchor_refs)
+            opt = (arrays, data)
         return SystemSnapshot(self.manifest(), self.component_snapshots(), {g: dict(v) for g, v in self.edge_params.items()}, opt,
                               {"bit_generator": self.rng.bit_generator.state, "n_updates": self.n_updates},
                               mem, {"experiment": copy.deepcopy(self.exp.raw), "arm_id": self.arm.arm_id, "arm": copy.deepcopy(self.arm.raw)}, kind)
@@ -368,7 +528,7 @@ class NessSystem:
         compiled = compile_graph(arm.composition, registry, scenario.observation_fields(), spaces, roles)
         if compiled.composition_hash != snap.manifest.composition_hash:
             raise ContractViolation("checkpoint composition hash differs from the recompiled composition; refusing to restore")
-        report = bootstrap(runtime_request_for(exp, {cn.descriptor.runtime for cn in compiled.nodes}))
+        report = bootstrap(runtime_request_for(exp, compiled_backends(compiled)))
         node_states = {}
         for cn in compiled.nodes:
             nid = cn.spec.node_id
@@ -382,10 +542,30 @@ class NessSystem:
         rng.bit_generator.state = snap.rng_state["bit_generator"]
         inference_profile = resolve_inference_profile(arm.inference.get("profile", "direct"), bool(arm.inference.get("allow_experimental", False)))
         rules, credit, optimizer, learning_profile = cls._build_learning(exp, arm, registry, compiled)
+        plan, credit = cls._build_objectives(arm, compiled, scenario, tasks, credit, rules)
+        anchor_refs: dict[str, Any] | None = {} if plan is None or not plan.anchors else None
         if rules and snap.optimizer:
-            optimizer = Optimizer.restore(*snap.optimizer)
+            restored_opt = Optimizer.restore(*snap.optimizer)
+            if optimizer is not None and restored_opt.config_canonical() != optimizer.config_canonical():
+                raise ContractViolation("checkpoint optimizer configuration (kind, lr, schedule, param_groups, ...) differs from the arm's; refusing to restore")
+            restored_opt.bind_groups([g for g, r in credit.owners.items() if r != FROZEN])
+            optimizer = restored_opt
+            stored = set(snap.optimizer[1].get("anchors", ()))
+            if plan is not None and plan.anchors:
+                declared = {o.objective_id for o in plan.anchors}
+                if stored and stored != declared:
+                    raise ContractViolation(f"checkpoint anchor references {sorted(stored)} do not match the arm's anchors {sorted(declared)}")
+                if stored:
+                    anchor_refs = {}
+                    for k, a in snap.optimizer[0].items():
+                        if k.startswith("a|"):
+                            _, oid, rest = k.split("|", 2)
+                            gid, name = rest.split("|", 1)
+                            anchor_refs.setdefault(oid, {}).setdefault(gid, {})[name] = np.asarray(a, dtype=np.float64)
         memory = cls._attach_memory(arm, registry, scenario, exp, imported=snap.memory) if snap.memory is not None else None
         sys_ = cls(exp, arm, registry, scenario, tasks, compiled, node_states, edge_params, rng, memory, inference_profile, learning_profile, credit, rules, optimizer, int(snap.rng_state.get("n_updates", 0)), report)
+        sys_.objectives = plan
+        sys_.anchor_refs = anchor_refs
         if sys_.manifest().manifest_id != snap.manifest_id:
             raise ContractViolation("restored system manifest id differs from checkpoint manifest id")
         return sys_

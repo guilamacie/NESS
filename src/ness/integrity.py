@@ -2,8 +2,10 @@
 core was not modified.
 
 ``core_source_hash()`` hashes every ``.py`` file under ``ness/`` except the reference plugins
-(they are ordinary plugins that happen to ship with the platform) and the baseline file
-itself. The baseline recorded at release lives in ``ness/_core_hash.py``; ``ness audit``
+(they are ordinary plugins that happen to ship with the platform), the baseline file itself,
+and anything inside a hidden directory (``.ipynb_checkpoints/``, editor and tool caches) or
+``__pycache__``: exactly the sources a wheel ships, so an editor autosave in a development tree
+can never change the hash (ADR-0016). The baseline recorded at release lives in ``ness/_core_hash.py``; ``ness audit``
 compares the two, and ``tests/test_core_hash.py`` fails whenever core changes without the
 baseline being regenerated (``python tools/update_core_hash.py``).
 
@@ -28,9 +30,10 @@ def core_source_hash(package_dir: Path | None = None) -> str:
     root = package_dir or Path(ness.__file__).parent
     h = hashlib.sha256()
     for p in sorted(root.rglob("*.py")):
-        if any(part in EXCLUDED_PARTS for part in p.parts) or p.name == BASELINE_FILE:
+        rel = p.relative_to(root)
+        if any(part in EXCLUDED_PARTS or part.startswith(".") for part in rel.parts[:-1]) or p.name == BASELINE_FILE or p.name.startswith("."):
             continue
-        h.update(str(p.relative_to(root)).replace("\\", "/").encode())
+        h.update(str(rel).replace("\\", "/").encode())
         h.update(p.read_bytes())
     return h.hexdigest()
 

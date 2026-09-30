@@ -60,6 +60,7 @@ class NodeInfo:
     output_ports: list[str] = field(default_factory=list)   # "name shape" strings when resolved
     config_summary: str = ""
     enabled: bool = True
+    training_only: bool = False
 
 
 @dataclass
@@ -146,7 +147,7 @@ def model_from_spec(arm: ArmSpec, registry: Any | None = None, observation_field
     spec = arm.composition
     kinds = _infer_kinds(spec, registry)
     nodes = [NodeInfo(n.node_id, n.plugin, kinds[n.node_id], config_summary=_config_summary(n.config), enabled=n.enabled,
-                      input_ports=[w.port for w in n.inputs]) for n in spec.nodes]
+                      input_ports=[w.port for w in n.inputs], training_only=n.training_only) for n in spec.nodes]
     edges: list[EdgeInfo] = []
     fields: dict[str, str] = dict(observation_fields or {})
     for n in spec.nodes:
@@ -172,7 +173,7 @@ def model_from_compiled(arm: ArmSpec, compiled: Any) -> GraphModel:
                               any(g.mutability == "trainable" for g in d.parameter_groups),
                               [p.name for p in d.input_ports],
                               [f"{p.name} {tuple(p.schema.shape)}" for p in d.output_ports],
-                              _config_summary(cn.spec.config), cn.spec.enabled))
+                              _config_summary(cn.spec.config), cn.spec.enabled, cn.training_only))
     edges: list[EdgeInfo] = []
     for cn in compiled.nodes:
         for port, ri in cn.inputs.items():
@@ -286,8 +287,10 @@ def draw_composition(model: GraphModel, path: Path, dpi: int = 150) -> Path:
     box(OBSERVATION_NODE, "observations\n" + "\n".join(f"{f} [{model.observation_fields.get(f, '?')}]" if f != "..." else f for f in shown), KIND_COLOR["observation"])
     for n in model.nodes:
         detail = f"[{n.runtime}]" + (" trainable" if n.trainable else " frozen") if model.resolved else f"({KIND_LABEL.get(n.kind, n.kind)})"
+        if n.training_only:
+            detail += "\nTRAINING-ONLY (targets; never predicts)"
         box(n.node_id, f"{n.node_id}\n{n.plugin}\n{detail}", KIND_COLOR.get(n.kind, KIND_COLOR["unknown"]), lw=1.7 if n.trainable else 0.9,
-            ls="-" if n.enabled else ":", under=wiring_by_node.get(n.node_id))
+            ls=(":" if not n.enabled else ("--" if n.training_only else "-")), under=wiring_by_node.get(n.node_id))
 
     seen: set[tuple[str, str]] = set()
     k = 0

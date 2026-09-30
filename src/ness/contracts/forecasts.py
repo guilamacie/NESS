@@ -142,10 +142,15 @@ class CategoricalForecast(Forecast):
     forecast_type: str = "categorical"
 
     def __post_init__(self) -> None:
-        lp = np.asarray(self.log_probs, dtype=np.float64)
+        raw = np.asarray(self.log_probs)
+        lp = np.asarray(raw, dtype=np.float64)
         z = np.log(np.sum(np.exp(lp), axis=-1))
-        if not np.allclose(z, 0.0, atol=1e-6):
-            raise ContractViolation("categorical log_probs must be normalised along the last axis")
+        # tolerance follows the producer's precision: float32 log-softmax over many classes carries
+        # rounding far above 1e-6; float64 keeps the v0.2 bound
+        eps = np.finfo(raw.dtype).eps if np.issubdtype(raw.dtype, np.floating) else np.finfo(np.float64).eps
+        atol = max(1e-6, 32.0 * float(eps) * float(np.sqrt(lp.shape[-1])))
+        if not np.allclose(z, 0.0, atol=atol):
+            raise ContractViolation(f"categorical log_probs must be normalised along the last axis (max |logsumexp| {float(np.max(np.abs(z))):.3g} > {atol:.3g})")
         object.__setattr__(self, "log_probs", lp)
         lp.setflags(write=False)
 
@@ -153,8 +158,11 @@ class CategoricalForecast(Forecast):
         return np.take_along_axis(self.log_probs, np.asarray(y)[..., None], axis=-1)[..., 0]
 
     def sample(self, n: int, rng: np.random.Generator) -> np.ndarray:
+        """``n`` samples of every row: shape ``[n, *leading axes]`` (bug B-1: v0.2 sampled the first row only)."""
         p = np.exp(self.log_probs)
-        return np.stack([rng.choice(p.shape[-1], p=p.reshape(-1, p.shape[-1])[0]) for _ in range(n)])
+        rows = p.reshape(-1, p.shape[-1])
+        lead = p.shape[:-1]
+        return np.stack([np.array([rng.choice(p.shape[-1], p=r / r.sum()) for r in rows]).reshape(lead) for _ in range(n)])
 
     def dense(self) -> np.ndarray:
         return self.log_probs

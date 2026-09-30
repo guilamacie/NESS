@@ -68,7 +68,10 @@ def parse_node(d: dict[str, Any]) -> NodeSpec:
     if "id" not in d or "plugin" not in d:
         raise CompositionError(f"node needs 'id' and 'plugin': {d!r}")
     inputs = tuple(parse_input(p, v) for p, v in dict(d.get("inputs", {})).items())
-    return NodeSpec(d["id"], d["plugin"], dict(d.get("config", {})), inputs, tuple(d.get("memory_queries", ())), bool(d.get("enabled", True)))
+    to = d.get("training_only", False)
+    if not isinstance(to, bool):
+        raise CompositionError(f"node {d['id']}: training_only must be true/false, got {to!r}")
+    return NodeSpec(d["id"], d["plugin"], dict(d.get("config", {})), inputs, tuple(d.get("memory_queries", ())), bool(d.get("enabled", True)), to)
 
 
 def parse_composition(d: dict[str, Any]) -> CompositionGraphSpec:

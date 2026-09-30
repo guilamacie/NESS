@@ -74,7 +74,13 @@ Delivered and verified:
   (diagrams of any configuration);
 * the executed **toy vertical slice** (six arms, ten substitutions, three seeds, LaTeX/PDF
   write-up in `reports/`), seven quick-start examples and two architecture examples, and an
-  **external example plugin package** that registers without editing core code.
+  **external example plugin package** that registers without editing core code;
+* from 0.3: declared **learning objectives** (task, `port_target` against training-only nodes or
+  revealed auxiliary targets, parameter anchors) with a loss registry, **training-only nodes**,
+  optimizer **parameter groups and schedules**, **numerics** (matmul precision, deterministic
+  XLA) in the runtime contract and manifests, **inference-only runtimes** (`jax_inference`) with
+  one backend rule for every launch path, and a runner generic over forecast types
+  (ADR-0012 to ADR-0017).
 
 Not delivered (declared, fail explicitly): Hyperon-backed memory, TimesFM or vision/text
 providers, composition-level recurrent `InferenceWorkspace` regions (a recurrent FabricPC
@@ -257,7 +263,12 @@ prediction_spaces, allowed_roles)`):
    edge `differentiable` or a **stop edge**, and refuse learned transforms into a
    non-differentiable destination;
 7. validate the output port against the task's prediction space (forecast type, coordinates);
-8. compute `composition_hash` over the spec, every descriptor and the observation schema.
+8. training-only nodes (ADR-0012): each must be frozen (no trainable groups) and not a memory
+   query; only training-only nodes may read one; no task output may read one. Together these
+   prove there is no path from a training-only node to a prediction. Training-only nodes are
+   never differentiable and are listed in `CompiledGraph.training_only_nodes`;
+9. compute `composition_hash` over the spec, every descriptor and the observation schema
+   (a node's `training_only` flag enters the spec's canonical form only when true).
 
 The result is a `CompiledGraph` (nodes in topological order with `ResolvedInput`s, outputs,
 edge parameter specs, the differentiable runtime, stop edges) and `resolved_wiring()`, the
@@ -314,7 +325,11 @@ The shipped plugins, their ports and configuration keys are tabulated in the qui
 *Runtime is a declared per-module property.* Frozen providers and host-side modules run in
 `numpy`/`host`; trainable numeric modules run in the NESS JAX backend (`jax`) and implement a
 pure `apply` next to `forward`; FabricPC workspaces run in `fabricpc`
-(`docs/FABRICPC_BACKEND.md`). A learning rule declares `required_runtime()` and may only own
+(`docs/FABRICPC_BACKEND.md`). Frozen modules that compute with JAX declare the inference-only
+runtime `jax_inference`: the process bootstraps JAX for them, but they are never part of a
+differentiable region (constants, like numpy modules). The backend a process needs is, for
+every node, the more capable of its runtime's backend and its declared `requires`, by the same
+rule in `NessSystem.build` and the runner (ADR-0015). A learning rule declares `required_runtime()` and may only own
 parameter groups of modules in that runtime; several rules can co-own a graph (hybrid credit,
 PDF §11.6), each computing gradients from the same pre-update snapshot. Both merges and module
 code are written against `xp`, so the eager path (numpy) and the traced path (jax.numpy)
@@ -328,7 +343,14 @@ selected / realized devices, the JAX backend actually initialised, whether Fabri
 the existing bootstrap satisfies it (a FabricPC bootstrap satisfies a JAX request; a
 pinned-platform request is judged against the realised platform) and refused otherwise, since
 JAX cannot be re-initialised in-process. `ness doctor` prints the report and the probed
-capabilities.
+capabilities. `ensure_bootstrapped` (used by backends) honours an existing launcher request,
+raising only the backend; a prediction during which a node forced such an upgrade fails closed.
+
+**Numerics** (ADR-0014). `runtime.numerics: {matmul_precision, deterministic}` is applied by the
+bootstrap before the first JAX computation (JAX matmul precision; deterministic XLA flags merged
+into `XLA_FLAGS`, conflicts fail closed) and recorded in `RuntimeReport.numerics`. The declared
+values, the effective precision and numeric variables the user set enter the manifest's runtime
+identity (`extra.runtime.numerics`, present only when non-trivial).
 
 **NESS JAX backend** (`ness.backends.jax`). `DifferentiableRegion` runs the graph twice: an
 eager pass records every input that enters a jax node from a host node, frozen provider or
@@ -367,9 +389,23 @@ they implement (`workspace_pc_local`, `workspace_epc_local`, `workspace_bp_unrol
 plugin's `AlgorithmSpec` in the manifest is the identity (`manifest.extra["algorithm_specs"]`).
 
 *Losses* are owned by tasks (`loss_terms(pred, y, mask, xp)`), reduced as sum of numerators over
-sum of denominators once per task, weighted across tasks; never a mean of means. Optimizers
-(`adam`, `sgd`; `clip_norm`) skip frozen groups and snapshot their moments for learner
-checkpoints.
+sum of denominators once per task, weighted across tasks; never a mean of means.
+
+*Objectives* (`ness.learning.objectives`, ADR-0012). `learning.objectives` generalises the task
+losses: `task`, `port_target` (a registry loss between a differentiable port and a constant
+target from a non-differentiable node or a revealed auxiliary target) and `parameter_anchor`.
+`bind_objectives` validates them against the compiled graph, the scenario's fields and the
+credit map; `NessSystem._prepare_objectives` decides per batch item which objectives apply
+(`applies_to` filters), runs the training-only nodes they need on the recorded values and
+attaches constant targets; the JAX region differentiates the weighted sum (each objective a
+sum of numerators over a sum of denominators); anchors add `w * (theta - theta_ref)` for any
+rule. Without objectives the region's v0.2 path runs unchanged.
+
+*Optimizers* (`ness.learning.optimizers`, ADR-0013): `adam` / `sgd` with decoupled weight decay
+and global `clip_norm`; ordered `param_groups` rules (glob over owned group ids; `lr` or
+`lr_scale`, `weight_decay`, `grad_multiplier`, `clip_norm`) and a step `schedule` (warm-up then
+constant / linear / cosine). Frozen groups are skipped; moments, step and rules go into learner
+checkpoints; per-group statistics are logged per update.
 
 ## 8. Host-side subsystems: symbolic, memory, probabilistic
 
@@ -418,7 +454,10 @@ the memory views (snapshot cut at the request origin), applies the task's `permi
 (observed + known-future fields only), executes the graph, and returns an immutable
 `PredictionRecord` (forecast, evidence graph, costs, diagnostics). `reveal(request_id,
 outcomes)` scores the forecast and stores an idempotent `ExperienceEvent`; in `prequential`
-mode it also queues the matured episode for memory. `learn_step()` performs one complete
+mode it also queues the matured episode for memory and hands the auxiliary-target fields that
+objectives read (outcome-only, never in a permitted view) to the learning item; an item may be
+revealed with no task outcome (e.g. a preservation stream). With `retention="outputs"` a frozen
+transaction drops each execution record once its outcome is revealed. `learn_step()` performs one complete
 optimizer update on the pending batch under the credit map, then publishes pending memory to a
 *new* snapshot; in-flight predictions keep their pinned views. `frozen` mode performs no
 updates of any kind. `assert_target_free(predict, request)` (`ness.plugin_api.testkit.causality`)
@@ -455,7 +494,9 @@ over the same `batch_size x updates` requests for every arm, frozen or trainable
 checkpoint publish and restore with a re-prediction of the first `restore_check_requests` test
 requests (difference must be exactly zero); frozen evaluation on the test split; the causal
 check; wall-clock per phase and peak RSS. Paired per-request differences against the reference
-arm are reported per seed. Configuration-only `substitutions` go through validate, predict,
+arm are reported per seed. Checks compare `forecast.dense()`, so any forecast type works; rows
+carry element-wise columns when the forecast has a point of the outcome's size, and otherwise the
+task's score and optional `row_metrics` (ADR-0017); pairing then uses the score. Configuration-only `substitutions` go through validate, predict,
 causal, train (when trainable) and restore, and are recorded with resolved plugin ids next to
 the core source hash. A failed arm or substitution is recorded, never dropped.
 
@@ -527,6 +568,9 @@ show the intended usage. Core changes go through an ADR in `docs/decisions/`.
 | paired, identical request streams; controls first | shared scenario in the runner; native and same-fact control arms in the reference study |
 | memory is pinned per prediction, published between updates, optional by default | `MemoryView`; learner branch; `MemoryAttachment` only when configured |
 | plugins register through entry points; the core never names them | `PluginRegistry.discover`; reference plugins use the same mechanism |
+| a training-only node never influences a prediction | compiler path proof; executor skips it; tests compare predictions with and without it (ADR-0012) |
+| learning targets are constants; objectives differentiate only what their rule can | `bind_objectives` (`GradientBoundaryError`); targets from non-differentiable nodes or revealed auxiliary fields |
+| the manifest states the realised numerical runtime | one backend rule for all launch paths; `ensure_bootstrapped` honours the launcher request; numerics in `extra.runtime` (ADR-0014/0015) |
 | instances never modify core | `ness.integrity`: a release baseline hash of the core sources; `ness audit --strict` fails on any modified core; `tests/test_core_hash.py` fails on core changes without a baseline update; `docs/AGENT_HANDOFF.md` §1 lists the file boundary |
 
 The decisions behind these rules are recorded as ADRs in `docs/decisions/` (one execution
@@ -562,6 +606,10 @@ verb, substrates as explicit nodes, memory pinning and publication, and others).
 | T01/T30 locks and gates (backend) | `tests/test_bootstrap_import_order.py`, `tests/test_devices.py`, `ness.backends.fabricpc.version` |
 | T22 runtime boundary (FabricPC) | `test_fabricpc_integration.py::test_cross_runtime_ownership_is_refused`, `::test_learned_boundary_transform_into_fabricpc_node_is_refused` |
 | pipeline and examples | `test_toy_slice_pipeline.py`, `test_quickstart_configs.py`, `test_visualize.py` |
+| 0.3 objectives, training-only nodes, anchors (A1-A5) | `test_objectives.py` |
+| 0.3 parameter groups, schedules (B1-B3) | `test_optimizer_groups.py` |
+| 0.3 numerics, inference-only runtimes (C1-C4) | `test_numerics_runtime.py` |
+| 0.3 runner over forecast types, retention, categorical fixes | `test_v030_runner_generic.py` |
 
 Not exercised (no implementation to test): T10 caches, T11 paired optimizer state (partially:
 identical request streams), T12 sparse probability interface, T15 accounting beyond per-node

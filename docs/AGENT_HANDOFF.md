@@ -71,7 +71,7 @@ its own repository. With that layout there is no core source tree in your workin
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install "ness[jax,report] @ git+https://github.com/guilamacie/NESS.git@v0.2.1"   # add fabricpc if you need it
+pip install "ness[jax,report] @ git+https://github.com/guilamacie/NESS.git@v0.3.0"   # add fabricpc if you need it
 mkdir my_ness_instance && cd my_ness_instance && git init
 ```
 
@@ -135,6 +135,9 @@ numpyro = ["numpyro>=0.15"]
 my_timesfm_substrate = "my_ness_instance.descriptors:MY_TIMESFM_SUBSTRATE"
 my_gru_upper_module = "my_ness_instance.descriptors:MY_GRU_UPPER"
 my_energy_market_dataset = "my_ness_instance.descriptors:MY_DATASET"
+
+[project.entry-points."ness.losses"]                  # optional (0.3): extra objective losses (LossSpec)
+my_loss = "my_ness_instance.losses:MY_LOSS"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -257,10 +260,14 @@ the uncached one.
 | generic differentiable module trained by BP | NESS JAX backend (`runtime = "jax"`, `apply(...)`) | `bp_direct` (per-item, `batched`, or `data_parallel`) |
 | predictive-coding / ePC / recurrent workspace | FabricPC backend: reuse `fabricpc_residual_cap` (dense PC graph) or write a cap that builds its own FabricPC graph through the compat adapter | `fabricpc_pc_local`, `fabricpc_bp_through_inference` |
 | both in one arm | jax upper + FabricPC cap with `learning.credit.overrides` | hybrid: each rule owns its runtime's groups |
+| a *frozen* module that computes with JAX (a pretrained trunk, a teacher) | `runtime = "jax_inference"` (declare `requires=("jax",)` too) | none: its outputs are constants, it needs no `apply`, and the process bootstraps JAX for it with your `runtime` settings |
 
 Declare `runtime:` in the experiment (`backend: auto|numpy|jax|fabricpc`, `platform`,
 `devices: {platform, selection|ids, count, fallback}`, `x64`, `profile: development|scientific`).
-`profile: scientific` refuses unverified FabricPC versions and a late `setup_jax`. Read
+`profile: scientific` refuses unverified FabricPC versions and a late `setup_jax`. Declare
+`runtime.numerics: {matmul_precision: highest, deterministic: true}` when results must be
+reproducible to float32 rounding on GPUs; never set `XLA_FLAGS` or JAX precision yourself (a
+conflict is an error, and the declared values enter the manifest). Read
 `docs/FABRICPC_BACKEND.md` before writing a FabricPC-backed module: prediction must clamp
 inputs only; the PC clamp belongs to the learning rule; record a complete `algorithm_spec()`.
 
@@ -352,6 +359,39 @@ that yields role-tagged bundles + queries and *no targets*, `outcome(request_id,
 `available_at` after the origin and coordinate masks, `grouping_metadata`). Optionally
 `matured_episodes(before_origin, namespace)` for memory seeding. Run `ScenarioContractMixin`.
 
+Optional task hook `row_metrics(forecast, outcome) -> {name: float}`: per-request scalars the
+runner writes to `predictions/*.csv` when the forecast is not element-wise comparable with the
+outcome (e.g. logits over a vocabulary against token ids: NLL, top-1). Without it such rows carry
+the score; checks compare `forecast.dense()`, so any forecast type runs through `ness run`.
+
+Auxiliary targets (labels an objective needs that must never reach a prediction, e.g. relation
+labels for a semantic head): declare them in `observation_fields()` with role `outcome_only`,
+put them in the request bundle, and name them in an objective as `{auxiliary: <field>}`. NESS
+keeps them out of every permitted view, refuses to wire them, perturbs them in the causal check
+and hands them to learning at `reveal`.
+
+### 5.10 Training protocols: objectives, teachers, anchors, learning rates (0.3)
+
+Everything below is configuration of your experiment file (syntax: `docs/QUICKSTART.md` §5);
+none of it needs a core change or an out-of-band optimizer step.
+
+* **Teacher / preservation losses on an intermediate port.** Add the teacher as a node with
+  `training_only: true` (frozen, typically `runtime = "jax_inference"`), and an objective
+  `{kind: port_target, source: module://student/logits, target: substrate://teacher/logits,
+  loss: kl_last_axis, weight: ...}`. The compiler proves the teacher never feeds a prediction;
+  it runs only when learning needs its output. Use `applies_to: {group: {stream: ...}}` to apply
+  an objective to one request stream only (set `request.group["stream"]` in your scenario).
+* **Your own loss.** Export a `LossSpec(name, fn, description, config_keys)` through the
+  `ness.losses` entry point; `fn(pred, target, mask, xp, **config) -> (numerator, denominator)`
+  must be written against `xp` (numpy and jax.numpy) and be domain-neutral in its contract.
+* **Anchors.** `{kind: parameter_anchor, groups: ["student/*"], weight: ...}` ties groups to
+  their weights at build time (for example your distilled checkpoint loaded in `initialize`);
+  the reference travels in learner checkpoints.
+* **Different learning rates per module.** `optimizer.param_groups` with `lr_scale` / `lr`,
+  plus `schedule`. Do not reparametrise parameters inside your module to emulate this.
+* Task and `port_target` objectives are evaluated by `bp_direct` in per-item mode; declaring
+  them with `batched` / `data_parallel` or next to a FabricPC rule is refused, not approximated.
+
 ## 6. Assemble, validate, draw, run, report
 
 ```yaml
@@ -421,6 +461,7 @@ the NESS maintainers as an issue (or a pull request against the NESS repository 
 |---|---|---|
 | a new module kind, selector scheme, boundary transform, merge operator, port kind or evidence type | vocabulary the compiler and every plugin rely on | the contract, shape and gradient rules, an ADR draft, tests |
 | a new learning rule or inference profile name | the platform vocabulary with verified/experimental/unsupported status | the algorithm spec, parity tests against an existing rule, status |
+| objectives in batched / data-parallel mode or with FabricPC rules; preserving producer dtypes; a device-resident optimizer | verified per-item today (ADR-0012, ADR-0017); performance work (N-06) | the use case, measured cost, parity tests |
 | a new numerical backend (torch, ...) or a FabricPC compat module for a new version | bootstrap, capability probes, version routing, credit map | region, rule, bootstrap hook, probes, compatibility-matrix entry, import-order tests |
 | a composition-level recurrent workspace solver, caches, separate task views | executor and transaction semantics | the seam is `composition.InferenceWorkspaceSpec`, `runtime/executor.py`, `NessSystem._policy_for` |
 | a change to manifests, checkpoints, artifact layout or the CLI | whole-system identity and reproducibility | migration path and tests |

@@ -145,7 +145,7 @@ def run_arm(exp: ExperimentSpec, arm: ArmSpec, registry: PluginRegistry, scenari
         outcomes = {q.task_id: scenario.outcome(req.request_id, q.query_id) for q in req.queries}
         outcomes = {k: v for k, v in outcomes.items() if v is not None}
         ev = tx.reveal(req.request_id, outcomes)
-        pred_rows.append(ArtifactWriter.prediction_row(arm.arm_id, seed, "train", req, rec.outputs, outcomes, ev.scores))
+        pred_rows.append(ArtifactWriter.prediction_row(arm.arm_id, seed, "train", req, rec.outputs, outcomes, ev.scores, system.tasks))
         ex = tx.execution_of(req.request_id)
         if ex is not None and writer is not None:
             ev_rows.extend(ArtifactWriter.evidence_rows(arm.arm_id, seed, "train", req, ex))
@@ -154,7 +154,10 @@ def run_arm(exp: ExperimentSpec, arm: ArmSpec, registry: PluginRegistry, scenari
             if diag is not None:
                 n_updates += 1
                 rep.train_loss_trace.append({"update": n_updates, "loss": float(diag["loss"]), "grad_norm": diag.get("grad_norm"),
-                                             **{f"rule/{k}/loss": v.get("loss") for k, v in diag.get("rules", {}).items()}})
+                                             **{f"rule/{k}/loss": v.get("loss") for k, v in diag.get("rules", {}).items()},
+                                             **{f"objective/{oid}/{m}": v[m] for oid, v in diag.get("objectives", {}).items() for m in ("value", "weight", "numerator", "denominator", "items")},
+                                             **{f"opt/{gid}/{m}": v[m] for gid, v in (diag.get("optimizer") or {}).get("groups", {}).items()
+                                                for m in ("lr", "grad_multiplier", "grad_norm_raw", "grad_norm_applied", "update_norm")}})
     rep.train = _aggregate(tx.aggregate_scores(), [r for r in pred_rows if r["phase"] == "train"], task_ids)
     rep.n_updates = system.n_updates
     rep.seconds["train"] = time.time() - t1
@@ -172,7 +175,7 @@ def run_arm(exp: ExperimentSpec, arm: ArmSpec, registry: PluginRegistry, scenari
 
     # ---- frozen evaluation (+ restore diff on the first N requests, + causal check on the first)
     t3 = time.time()
-    te = PredictionTransaction(system, mode="frozen")
+    te = PredictionTransaction(system, mode="frozen", retention=str(proto.get("retention", "full")))
     n_restore = int(proto.get("restore_check_requests", 8))
     diffs: list[dict[str, Any]] = []
     first = True
@@ -184,17 +187,17 @@ def run_arm(exp: ExperimentSpec, arm: ArmSpec, registry: PluginRegistry, scenari
         outcomes = {q.task_id: scenario.outcome(req.request_id, q.query_id) for q in req.queries}
         outcomes = {k: v for k, v in outcomes.items() if v is not None}
         ev = te.reveal(req.request_id, outcomes)
-        pred_rows.append(ArtifactWriter.prediction_row(arm.arm_id, seed, "test", req, rec.outputs, outcomes, ev.scores))
+        pred_rows.append(ArtifactWriter.prediction_row(arm.arm_id, seed, "test", req, rec.outputs, outcomes, ev.scores, system.tasks))
         ex = te.execution_of(req.request_id)
         if ex is not None and writer is not None:
             ev_rows.extend(ArtifactWriter.evidence_rows(arm.arm_id, seed, "test", req, ex))
         if restored is not None and len(diffs) < n_restore:
             r2, _, _ = restored.predict(req)
-            d = max(float(np.max(np.abs(rec.outputs[q.query_id].point() - r2.outputs[q.query_id].point()))) for q in req.queries)
+            d = max(float(np.max(np.abs(rec.outputs[q.query_id].dense() - r2.outputs[q.query_id].dense()))) for q in req.queries)
             diffs.append({"arm": arm.arm_id, "seed": seed, "request_id": req.request_id, "origin": req.origin, "max_abs_diff": d})
         if first and proto.get("causal_check", True):
             try:
-                assert_target_free(lambda r: {k: v.point() for k, v in system.predict(r)[0].outputs.items()}, req)
+                assert_target_free(lambda r: {k: v.dense() for k, v in system.predict(r)[0].outputs.items()}, req)
                 rep.causal_check = "pass"
             except AssertionError as exc:
                 rep.causal_check = "FAIL"
@@ -242,12 +245,12 @@ def run_substitution(exp: ExperimentSpec, sub: ArmSpec, registry: PluginRegistry
     test_req = next(iter(scenario.iter_requests(exp.protocol.get("test_split", "test"), tasks, {"max_requests": 1})))
     try:
         res, _, _ = system.predict(test_req)
-        assert all(np.all(np.isfinite(f.point())) for f in res.outputs.values())
+        assert all(np.all(np.isfinite(f.dense())) for f in res.outputs.values())
         row["predict"] = "pass"
     except Exception as exc:
         row["predict"] = f"fail: {type(exc).__name__}: {str(exc)[:200]}"
     try:
-        assert_target_free(lambda r: {k: v.point() for k, v in system.predict(r)[0].outputs.items()}, test_req)
+        assert_target_free(lambda r: {k: v.dense() for k, v in system.predict(r)[0].outputs.items()}, test_req)
         row["causal"] = "pass"
     except Exception as exc:
         row["causal"] = f"fail: {type(exc).__name__}: {str(exc)[:200]}"
@@ -266,8 +269,8 @@ def run_substitution(exp: ExperimentSpec, sub: ArmSpec, registry: PluginRegistry
         try:
             mid = store.stage_and_publish(system.snapshot("learner"), f"sub:{sub.arm_id}", store.head(f"sub:{sub.arm_id}"))
             restored = NessSystem.from_snapshot(store.load(mid), registry, scenario)
-            a = system.predict(test_req)[0].outputs[test_req.queries[0].query_id].point()
-            b = restored.predict(test_req)[0].outputs[test_req.queries[0].query_id].point()
+            a = system.predict(test_req)[0].outputs[test_req.queries[0].query_id].dense()
+            b = restored.predict(test_req)[0].outputs[test_req.queries[0].query_id].dense()
             np.testing.assert_array_equal(a, b)
             row["restore"] = "pass"
             row["restore_manifest"] = mid
@@ -279,6 +282,26 @@ def run_substitution(exp: ExperimentSpec, sub: ArmSpec, registry: PluginRegistry
 
 
 # ---------------------------------------------------------------------------- experiment
+def experiment_backends(exp: ExperimentSpec, arms: list[ArmSpec], registry: PluginRegistry, scenario: Any) -> set[str]:
+    from ..composition import compile_graph
+    from ..runtime.system import compiled_backends
+    from ..runtimes.bootstrap import backend_for_requires
+    tasks = {t.task_id: registry.create(t.plugin, {**t.config, "task_id": t.task_id}) for t in exp.tasks}
+    roles = frozenset.intersection(*(t.allowed_roles() for t in tasks.values()))
+    spaces = {tid: t.prediction_space() for tid, t in tasks.items()}
+    out: set[str] = set()
+    for a in arms:
+        try:
+            out |= compiled_backends(compile_graph(a.composition, registry, scenario.observation_fields(), spaces, roles))
+        except Exception:  # noqa: BLE001 - the arm is built (and its failure recorded) later
+            for n in a.composition.enabled_nodes():
+                try:
+                    out.add(backend_for_requires(registry.describe(n.plugin).requires))
+                except Exception:  # noqa: BLE001
+                    pass
+    return out
+
+
 def run_experiment(exp: ExperimentSpec, registry: PluginRegistry, out_dir: str | Path | None = None, arms: tuple[str, ...] | None = None,
                    with_substitutions: bool = True, only_substitutions: bool = False) -> ExperimentReport:
     scenario = registry.create(exp.scenario.plugin, exp.scenario.config)  # shared: identical request streams across arms
@@ -290,13 +313,10 @@ def run_experiment(exp: ExperimentSpec, registry: PluginRegistry, out_dir: str |
     if not selected:
         raise ContractViolation(f"no arms selected from {[a.arm_id for a in exp.arms]}")
     substitutions = [parse_arm(d["id"], d) for d in exp.raw.get("substitutions", [])] if with_substitutions else []
-    # Bootstrap ONCE for the most capable backend any selected arm (or substitution) needs.
-    runtimes: set[str] = set()
-    for a in selected + substitutions:
-        for n in a.composition.enabled_nodes():
-            d = registry.describe(n.plugin)
-            runtimes.add("fabricpc" if "fabricpc" in d.requires else ("jax" if "jax" in d.requires else "numpy"))
-    rt = bootstrap(runtime_request_for(exp, runtimes))
+    # Bootstrap ONCE for the most capable backend any selected arm (or substitution) needs, by the
+    # same rule NessSystem.build uses (compiled node runtime + declared requires; ADR-0015). An arm
+    # that does not compile falls back to its plugins' declared requires; it fails, recorded, later.
+    rt = bootstrap(runtime_request_for(exp, experiment_backends(exp, selected + substitutions, registry, scenario)))
     report.runtime = rt.canonical()
     seeds = [int(s) for s in exp.protocol.get("seeds", [])] or None
     if writer is not None:
@@ -308,7 +328,11 @@ def run_experiment(exp: ExperimentSpec, registry: PluginRegistry, out_dir: str |
         writer.json("environment/dependency_lock.json", dependency_lock())
         writer.json("environment/plugins.json", [d.canonical() for d in registry.descriptors()])
         writer.json("environment/core_source_hash.json", {"sha256": core_source_hash(), "note": "hash of ness core sources (reference_plugins excluded) at run time"})
-        writer.write_dataset(scenario, tuple(registry.create(t.plugin, {**t.config, "task_id": t.task_id}) for t in exp.tasks))
+        art = dict(exp.protocol.get("artifacts") or {})
+        unknown = set(art) - {"ground_truth"}
+        if unknown:
+            raise ContractViolation(f"protocol.artifacts has unknown keys {sorted(unknown)}; allowed: ground_truth")
+        writer.write_dataset(scenario, tuple(registry.create(t.plugin, {**t.config, "task_id": t.task_id}) for t in exp.tasks), bool(art.get("ground_truth", True)))
         writer.log(f"run start protocol={exp.protocol_id} hash={exp.protocol_hash} backend={rt.backend}")
     for arm in ([] if only_substitutions else selected):
         for seed in (seeds or [arm.seed]):
@@ -334,9 +358,13 @@ def run_experiment(exp: ExperimentSpec, registry: PluginRegistry, out_dir: str |
             continue
         paired: dict[str, Any] = {}
         for task in rep.test:
-            diffs = np.array([rows[r][f"{task}/mse"] - ref_rows[r][f"{task}/mse"] for r in ref_rows])
+            # per-request element-wise MSE when both arms have it (point/quantile tasks, as in v0.2);
+            # otherwise the task's own score value (e.g. NLL of a categorical task)
+            metric = "mse" if all(f"{task}/mse" in rows[r] and f"{task}/mse" in ref_rows[r] for r in ref_rows) else "score"
+            diffs = np.array([rows[r][f"{task}/{metric}"] - ref_rows[r][f"{task}/{metric}"] for r in ref_rows])
             paired[task] = {"delta": rep.test[task]["loss"] - ref.test[task]["loss"], "mean_diff": float(diffs.mean()),
-                            "sd_diff": float(diffs.std(ddof=1)) if len(diffs) > 1 else 0.0, "n": int(len(diffs)), "reference": ref.key}
+                            "sd_diff": float(diffs.std(ddof=1)) if len(diffs) > 1 else 0.0, "n": int(len(diffs)), "reference": ref.key,
+                            **({} if metric == "mse" else {"metric": metric})}
         report.paired[key] = paired
     for sub in substitutions:
         row = run_substitution(exp, sub, registry, scenario, store)

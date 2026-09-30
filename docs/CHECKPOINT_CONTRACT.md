@@ -46,3 +46,11 @@ produced under a different FabricPC family fails closed (explicit migration requ
 `snapshot_state` must contain everything that affects predictions (params, buffers such as
 running statistics or fixed readouts, meta such as weight digests). Version bumps that change
 state layout increment the major version and either ship a `migrate_state` or fail closed.
+
+## Learner state added in 0.3 (ADR-0012, ADR-0013)
+
+The learner snapshot's optimizer blob also carries the schedule and `param_groups` rules (data)
+and, for `parameter_anchor` objectives, the reference parameters (arrays keyed
+`a|<objective>|<group>|<name>`, listed in `data.anchors`). Restoring refuses a checkpoint whose
+optimizer configuration differs from the arm's; a system restored from a serving checkpoint
+has no anchor reference and refuses to learn until one is set.

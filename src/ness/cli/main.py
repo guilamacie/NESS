@@ -35,7 +35,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
             continue
         try:
             compiled = compile_graph(a.composition, reg, scenario.observation_fields(), spaces, roles)
-            print(f"  arm {a.arm_id}: OK  composition {compiled.composition_hash[:12]} nodes={compiled.node_ids()} diff_runtime={compiled.differentiable_runtime}")
+            to = f" training_only={compiled.training_only_nodes}" if compiled.training_only_nodes else ""
+            print(f"  arm {a.arm_id}: OK  composition {compiled.composition_hash[:12]} nodes={compiled.node_ids()} diff_runtime={compiled.differentiable_runtime}{to}")
             for nid, ports in compiled.resolved_wiring().items():
                 for port, srcs in ports.items():
                     print(f"      {nid}.{port} <- {', '.join(srcs)}")

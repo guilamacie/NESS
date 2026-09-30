@@ -5,12 +5,43 @@ Status vocabulary: **verified** = implemented and covered by passing tests in th
 **experimental** = present but not to be relied on scientifically; **design-only** = declared
 name/contract exists, execution raises `UnsupportedCapability`.
 
-Test suite: 204 tests (`pytest -q`; backend-specific tests skip when an extra is absent: 3 skips
-on CPU with FabricPC installed, more without JAX). Both wheels build
+Test suite (0.3.0): 284 tests (`pytest -q`; backend-specific tests skip when an extra is absent):
+281 passed / 3 skipped on CPU jax 0.10.2 + FabricPC, 277 / 7 on jax 0.7.0, 278 / 6 on 2 x RTX 3090.
+Configurations without 0.3 options reproduce 0.2.1 bitwise (predictions, training histories,
+restore diffs; manifests equal up to the NESS version), including the recorded vertical-slice run. Both wheels build
 (`dist/ness-0.1.0-py3-none-any.whl`, `dist/ness_example_plugin-0.1.0-py3-none-any.whl`) and the
 core wheel installs into a fresh venv without JAX/FabricPC (`ness doctor --backend numpy`,
 schema-only validation, core tests). Exact environments exercised: CPU jax 0.10.2 + fabricpc 0.6.0;
 CPU jax 0.7.0 (range minimum) + fabricpc 0.6.0; 2 x RTX 3090 jax 0.10.2 (cuda12) + fabricpc 0.6.0.
+
+## v0.3.0 additions (2026-10-01; instance change request NESS_CORE_HANDOFF_2026-09-30)
+
+Verified (tests named in each ADR):
+
+* Learning objectives (ADR-0012): implicit/explicit task objectives, `port_target` objectives
+  with the `mse`, `kl_last_axis`, `cross_entropy` losses and the `ness.losses` entry point,
+  request filters, training-only nodes (compile-time path proof, never executed for a
+  prediction), revealed auxiliary targets, parameter anchors with checkpointed references,
+  per-objective accounting in the training history and manifest. Acceptance A1-A5.
+* Optimizer parameter groups and schedules (ADR-0013). Acceptance B1-B3; default path bitwise
+  equal to the v0.2.1 update.
+* `runtime.numerics` (ADR-0014) and inference-only runtimes with one backend rule for every
+  launch path, request-honouring on-demand bootstrap, fail-closed predictions when a node hides
+  its backend (ADR-0015). Acceptance C1-C4.
+* Core hash over shipped sources only (ADR-0016).
+* Runner, artifacts and checks generic over forecast types; `retention: outputs`; optional
+  ground-truth dump; categorical `sample` over every row and a dtype-aware normalisation
+  tolerance (ADR-0017). The instance's tiny token configuration runs through `ness run`.
+
+Design-only / declined for 0.3.0 (fail explicitly where selectable):
+
+* Task/`port_target` objectives in `batched` / `data_parallel` evaluation or next to a FabricPC
+  rule owning groups (`UnsupportedCapability`).
+* Preserving producer dtypes instead of float64 port payloads (N-07, second half) and the
+  throughput work N-06 (device-resident optimizer, single-jit batched mode, cheaper manifest
+  identity): not implemented.
+* A `categorical_forecast` port kind and reference categorical task/writer (N-01): not
+  implemented; logits as `PointForecast` run through the runner (ADR-0017).
 
 ## Verified
 
